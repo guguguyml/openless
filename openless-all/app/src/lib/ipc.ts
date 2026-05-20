@@ -23,6 +23,12 @@ import type {
   StylePackKind,
   StylePackRuntimeDiagnostics,
   StyleSystemPrompts,
+  PendingSyncChange,
+  SyncAuthSession,
+  SyncChangeOperation,
+  SyncEntityKind,
+  SyncSettings,
+  SyncState,
   UpdateChannel,
   UserPreferences,
   VocabPresetStore,
@@ -448,6 +454,25 @@ const mockCorrectionRules: CorrectionRule[] = [
   },
 ];
 
+let mockSyncSettings: SyncSettings = {
+  enabled: false,
+  serverUrl: '',
+  accountEmail: null,
+  deviceName: 'Mock device',
+};
+
+let mockSyncState: SyncState = {
+  deviceId: 'device-mock',
+  cursor: null,
+  lastSyncAt: null,
+  lastPushAt: null,
+  lastPullAt: null,
+  lastError: null,
+  pendingChanges: [],
+};
+
+let mockSyncAuthSession: SyncAuthSession | null = null;
+
 // ── Settings ───────────────────────────────────────────────────────────
 export function getSettings(): Promise<UserPreferences> {
   return invokeOrMock('get_settings', undefined, () => ({ ...mockSettings }));
@@ -542,6 +567,113 @@ export function setActiveLlmProvider(provider: string): Promise<void> {
 
 export function readCredential(account: string): Promise<string | null> {
   return invokeOrMock<string | null>('read_credential', { account }, () => null);
+}
+
+// ── Sync local state ───────────────────────────────────────────────────
+export function getSyncSettings(): Promise<SyncSettings> {
+  return invokeOrMock('get_sync_settings', undefined, () => ({ ...mockSyncSettings }));
+}
+
+export function setSyncSettings(settings: SyncSettings): Promise<SyncSettings> {
+  return invokeOrMock('set_sync_settings', { settings }, () => {
+    mockSyncSettings = { ...settings };
+    return { ...mockSyncSettings };
+  });
+}
+
+export function getSyncState(): Promise<SyncState> {
+  return invokeOrMock('get_sync_state', undefined, () => ({
+    ...mockSyncState,
+    pendingChanges: mockSyncState.pendingChanges.map(change => ({ ...change })),
+  }));
+}
+
+export function updateSyncCursor(cursor: string | null, syncedAt: string | null): Promise<SyncState> {
+  return invokeOrMock('update_sync_cursor', { cursor, syncedAt }, () => {
+    mockSyncState = {
+      ...mockSyncState,
+      cursor,
+      lastSyncAt: syncedAt,
+      lastPullAt: syncedAt,
+      lastError: null,
+    };
+    return {
+      ...mockSyncState,
+      pendingChanges: mockSyncState.pendingChanges.map(change => ({ ...change })),
+    };
+  });
+}
+
+export function setSyncLastError(error: string | null): Promise<SyncState> {
+  return invokeOrMock('set_sync_last_error', { error }, () => {
+    mockSyncState = { ...mockSyncState, lastError: error };
+    return {
+      ...mockSyncState,
+      pendingChanges: mockSyncState.pendingChanges.map(change => ({ ...change })),
+    };
+  });
+}
+
+export function enqueueSyncChange(
+  entity: SyncEntityKind,
+  entityId: string,
+  operation: SyncChangeOperation,
+): Promise<SyncState> {
+  return invokeOrMock('enqueue_sync_change', { entity, entityId, operation }, () => {
+    const change: PendingSyncChange = {
+      id: `change-${Date.now()}`,
+      entity,
+      entityId,
+      operation,
+      queuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    mockSyncState = {
+      ...mockSyncState,
+      pendingChanges: [
+        ...mockSyncState.pendingChanges.filter(item => !(item.entity === entity && item.entityId === entityId)),
+        change,
+      ],
+    };
+    return {
+      ...mockSyncState,
+      pendingChanges: mockSyncState.pendingChanges.map(item => ({ ...item })),
+    };
+  });
+}
+
+export function replaceSyncQueue(pendingChanges: PendingSyncChange[]): Promise<SyncState> {
+  return invokeOrMock('replace_sync_queue', { pendingChanges }, () => {
+    mockSyncState = {
+      ...mockSyncState,
+      pendingChanges: pendingChanges.map(change => ({ ...change })),
+    };
+    return {
+      ...mockSyncState,
+      pendingChanges: mockSyncState.pendingChanges.map(change => ({ ...change })),
+    };
+  });
+}
+
+export function getSyncAuthSession(): Promise<SyncAuthSession | null> {
+  return invokeOrMock('get_sync_auth_session', undefined, () => (
+    mockSyncAuthSession ? { ...mockSyncAuthSession } : null
+  ));
+}
+
+export function setSyncAuthSession(session: SyncAuthSession): Promise<void> {
+  return invokeOrMock('set_sync_auth_session', { session }, () => {
+    mockSyncAuthSession = { ...session };
+    return undefined;
+  });
+}
+
+export function clearSyncAuthSession(): Promise<void> {
+  return invokeOrMock('clear_sync_auth_session', undefined, () => {
+    mockSyncAuthSession = null;
+    return undefined;
+  });
 }
 
 export function validateProviderCredentials(kind: 'llm' | 'asr'): Promise<ProviderCheckResult> {

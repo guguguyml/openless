@@ -23,6 +23,51 @@ export interface DictationSession {
   hasAudioRecording: boolean | null;
 }
 
+export type SyncEntityKind =
+  | 'style_pack'
+  | 'dictionary_entry'
+  | 'correction_rule'
+  | 'vocab_preset'
+  | 'provider_config'
+  | 'history_item'
+  | 'preferences';
+
+export type SyncChangeOperation = 'upsert' | 'delete';
+
+export interface PendingSyncChange {
+  id: string;
+  entity: SyncEntityKind;
+  entityId: string;
+  operation: SyncChangeOperation;
+  queuedAt: string;
+  attempts: number;
+  lastError: string | null;
+}
+
+export interface SyncSettings {
+  enabled: boolean;
+  serverUrl: string;
+  accountEmail: string | null;
+  deviceName: string;
+}
+
+export interface SyncState {
+  deviceId: string;
+  cursor: string | null;
+  lastSyncAt: string | null;
+  lastPushAt: string | null;
+  lastPullAt: string | null;
+  lastError: string | null;
+  pendingChanges: PendingSyncChange[];
+}
+
+export interface SyncAuthSession {
+  accountEmail: string;
+  accessToken: string;
+  refreshToken: string | null;
+  accessTokenExpiresAt: string | null;
+}
+
 export interface DictionaryEntry {
   id: string;
   phrase: string;

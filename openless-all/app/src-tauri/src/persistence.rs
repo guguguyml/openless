@@ -25,8 +25,9 @@ use uuid::Uuid;
 use crate::types::{
     builtin_style_pack_for_mode, builtin_style_pack_id, builtin_style_packs,
     default_active_style_pack_id, CorrectionRule, CustomStylePrompts, DictationSession,
-    DictionaryEntry, PolishMode, StylePack, StylePackExample, StylePackKind, UserPreferences,
-    VocabPresetStore, BUILTIN_STYLE_PACK_LIGHT_ID,
+    DictionaryEntry, PendingSyncChange, PolishMode, StylePack, StylePackExample, StylePackKind,
+    SyncAuthSession, SyncSettings, SyncState, UserPreferences, VocabPresetStore,
+    BUILTIN_STYLE_PACK_LIGHT_ID,
 };
 
 const HISTORY_CAP: usize = 200;
@@ -40,6 +41,8 @@ const VOCAB_FILE: &str = "dictionary.json";
 const CORRECTION_RULES_FILE: &str = "correction-rules.json";
 const CORRECTION_NUM_TOKEN: &str = "{num}";
 const VOCAB_PRESETS_FILE: &str = "vocab-presets.json";
+const SYNC_SETTINGS_FILE: &str = "sync-settings.json";
+const SYNC_STATE_FILE: &str = "sync-state.json";
 
 /// 旧版 plaintext JSON 凭据路径。仅作为迁移来源；成功写入系统凭据库后会删除。
 const LEGACY_CREDS_DIR: &str = ".openless";
@@ -47,6 +50,7 @@ const LEGACY_CREDS_FILE: &str = "credentials.json";
 
 const KEYRING_CREDENTIALS_ACCOUNT: &str = "credentials.v1";
 const KEYRING_CREDENTIALS_CHUNK_PREFIX: &str = "credentials.v1.chunk.";
+const KEYRING_SYNC_AUTH_ACCOUNT: &str = "sync.auth.v1";
 // Windows Credential Manager caps one credential blob at 2560 bytes. keyring stores
 // passwords as UTF-16 on Windows, so keep each JSON chunk comfortably below that.
 const KEYRING_CHUNK_MAX_UTF16_UNITS: usize = 1000;
@@ -271,10 +275,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp_path = path.with_file_name(format!(
-        "{file_name}.tmp-{}",
-        Uuid::new_v4().simple()
-    ));
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp-{}", Uuid::new_v4().simple()));
     fs::write(&tmp_path, contents)
         .with_context(|| format!("write tmp failed: {}", tmp_path.display()))?;
     if let Err(err) = fs::rename(&tmp_path, path) {
@@ -1047,6 +1048,144 @@ impl PreferencesStore {
     }
 }
 
+// ───────────────────────── Sync local state ─────────────────────────
+
+pub struct SyncSettingsStore {
+    path: PathBuf,
+    state: Mutex<SyncSettings>,
+}
+
+impl SyncSettingsStore {
+    pub fn new() -> Result<Self> {
+        let dir = data_dir()?;
+        ensure_dir(&dir)?;
+        let path = dir.join(SYNC_SETTINGS_FILE);
+        let settings = read_or_default::<SyncSettings>(&path).unwrap_or_else(|error| {
+            log::warn!(
+                "[sync] load {} failed, using defaults: {}",
+                path.display(),
+                error
+            );
+            SyncSettings::default()
+        });
+        Ok(Self {
+            path,
+            state: Mutex::new(settings),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_path(path: PathBuf) -> Self {
+        let settings = read_or_default::<SyncSettings>(&path).unwrap_or_default();
+        Self {
+            path,
+            state: Mutex::new(settings),
+        }
+    }
+
+    pub fn get(&self) -> SyncSettings {
+        self.state.lock().clone()
+    }
+
+    pub fn set(&self, settings: SyncSettings) -> Result<()> {
+        let json = serde_json::to_vec_pretty(&settings).context("encode sync settings failed")?;
+        atomic_write(&self.path, &json)?;
+        *self.state.lock() = settings;
+        Ok(())
+    }
+}
+
+pub struct SyncStateStore {
+    path: PathBuf,
+    state: Mutex<SyncState>,
+}
+
+impl SyncStateStore {
+    pub fn new() -> Result<Self> {
+        let dir = data_dir()?;
+        ensure_dir(&dir)?;
+        Ok(Self::new_for_path(dir.join(SYNC_STATE_FILE)))
+    }
+
+    fn new_for_path(path: PathBuf) -> Self {
+        let mut state = read_or_default::<SyncState>(&path).unwrap_or_else(|error| {
+            log::warn!(
+                "[sync] load {} failed, using defaults: {}",
+                path.display(),
+                error
+            );
+            SyncState::default()
+        });
+        if state.device_id.trim().is_empty() {
+            state.device_id = SyncState::default().device_id;
+        }
+        if !path.exists() {
+            if let Ok(json) = serde_json::to_vec_pretty(&state) {
+                let _ = atomic_write(&path, &json);
+            }
+        }
+        Self {
+            path,
+            state: Mutex::new(state),
+        }
+    }
+
+    pub fn get(&self) -> SyncState {
+        self.state.lock().clone()
+    }
+
+    pub fn set(&self, state: SyncState) -> Result<()> {
+        if state.device_id.trim().is_empty() {
+            return Err(anyhow!("sync device id is empty"));
+        }
+        let json = serde_json::to_vec_pretty(&state).context("encode sync state failed")?;
+        atomic_write(&self.path, &json)?;
+        *self.state.lock() = state;
+        Ok(())
+    }
+
+    pub fn update_cursor(
+        &self,
+        cursor: Option<String>,
+        last_sync_at: Option<String>,
+    ) -> Result<SyncState> {
+        let mut state = self.get();
+        state.cursor = cursor;
+        state.last_sync_at = last_sync_at.clone();
+        state.last_pull_at = last_sync_at;
+        state.last_error = None;
+        self.set(state.clone())?;
+        Ok(state)
+    }
+
+    pub fn set_last_error(&self, error: Option<String>) -> Result<SyncState> {
+        let mut state = self.get();
+        state.last_error = error;
+        self.set(state.clone())?;
+        Ok(state)
+    }
+
+    pub fn enqueue(&self, change: PendingSyncChange) -> Result<SyncState> {
+        if change.entity_id.trim().is_empty() {
+            return Err(anyhow!("sync queue entity id is empty"));
+        }
+        let mut state = self.get();
+        state
+            .pending_changes
+            .retain(|item| !(item.entity == change.entity && item.entity_id == change.entity_id));
+        state.pending_changes.push(change);
+        self.set(state.clone())?;
+        Ok(state)
+    }
+
+    pub fn replace_queue(&self, pending_changes: Vec<PendingSyncChange>) -> Result<SyncState> {
+        let mut state = self.get();
+        state.pending_changes = pending_changes;
+        self.set(state.clone())?;
+        Ok(state)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StylePackArchiveManifest {
@@ -1065,9 +1204,19 @@ struct StylePackArchiveManifest {
     compatible_app_version: Option<String>,
     /// Marketplace 上游关系。旧 ZIP 没有此字段时自动为 None；
     /// 兼容早期口误/拼写包里可能出现的 `orion*` 字段名。
-    #[serde(default, alias = "orionPackId", alias = "orion_pack_id", alias = "origin_pack_id")]
+    #[serde(
+        default,
+        alias = "orionPackId",
+        alias = "orion_pack_id",
+        alias = "origin_pack_id"
+    )]
     origin_pack_id: Option<String>,
-    #[serde(default, alias = "orionAuthorLogin", alias = "orion_author_login", alias = "origin_author_login")]
+    #[serde(
+        default,
+        alias = "orionAuthorLogin",
+        alias = "orion_author_login",
+        alias = "origin_author_login"
+    )]
     origin_author_login: Option<String>,
 }
 
@@ -2257,13 +2406,45 @@ impl CredentialsVault {
     }
 }
 
+pub struct SyncAuthVault;
+
+impl SyncAuthVault {
+    pub fn get() -> Result<Option<SyncAuthSession>> {
+        let _guard = credentials_lock().lock();
+        let Some(value) = get_keyring_password(KEYRING_SYNC_AUTH_ACCOUNT)? else {
+            return Ok(None);
+        };
+        serde_json::from_str::<SyncAuthSession>(&value)
+            .map(Some)
+            .context("decode sync auth session")
+    }
+
+    pub fn set(session: &SyncAuthSession) -> Result<()> {
+        let _guard = credentials_lock().lock();
+        let json = serde_json::to_string(session).context("encode sync auth session")?;
+        keyring_entry_for(KEYRING_SYNC_AUTH_ACCOUNT)?
+            .set_password(&json)
+            .context("write sync auth session")
+    }
+
+    pub fn clear() -> Result<()> {
+        let _guard = credentials_lock().lock();
+        delete_keyring_password(KEYRING_SYNC_AUTH_ACCOUNT);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         chunk_json_payload, list_vocab_presets, read_preferences, save_vocab_presets,
-        sync_style_pack_preferences, validate_correction_rule_syntax, KEYRING_CHUNK_MAX_UTF16_UNITS,
+        sync_style_pack_preferences, validate_correction_rule_syntax, SyncStateStore,
+        KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
-    use crate::types::{builtin_style_packs, CustomStylePrompts, VocabPreset, VocabPresetStore};
+    use crate::types::{
+        builtin_style_packs, CustomStylePrompts, PendingSyncChange, SyncChangeOperation,
+        SyncEntityKind, VocabPreset, VocabPresetStore,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -2348,6 +2529,42 @@ mod tests {
             vec!["PR".to_string(), "CI".to_string()]
         );
         assert_eq!(loaded.disabled_builtin_preset_ids, vec!["chef".to_string()]);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sync_state_persists_device_cursor_and_queue() {
+        let tmp: PathBuf =
+            std::env::temp_dir().join(format!("openless-sync-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        let path = tmp.join("sync-state.json");
+        let store = SyncStateStore::new_for_path(path.clone());
+        let first = store.get();
+        assert!(!first.device_id.is_empty());
+
+        store
+            .update_cursor(
+                Some("cursor-42".into()),
+                Some("2026-05-20T00:00:00Z".into()),
+            )
+            .expect("update cursor");
+        store
+            .enqueue(PendingSyncChange {
+                id: "change-1".into(),
+                entity: SyncEntityKind::StylePack,
+                entity_id: "pack-1".into(),
+                operation: SyncChangeOperation::Upsert,
+                queued_at: "2026-05-20T00:00:01Z".into(),
+                attempts: 0,
+                last_error: None,
+            })
+            .expect("enqueue");
+
+        let reloaded = SyncStateStore::new_for_path(path).get();
+        assert_eq!(reloaded.device_id, first.device_id);
+        assert_eq!(reloaded.cursor.as_deref(), Some("cursor-42"));
+        assert_eq!(reloaded.pending_changes.len(), 1);
+        assert_eq!(reloaded.pending_changes[0].entity_id, "pack-1");
         let _ = fs::remove_dir_all(&tmp);
     }
 

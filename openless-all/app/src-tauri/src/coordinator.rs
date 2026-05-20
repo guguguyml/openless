@@ -33,7 +33,8 @@ use crate::hotkey::{HotkeyEvent, HotkeyMonitor};
 use crate::insertion::TextInserter;
 use crate::persistence::{
     sync_style_pack_preferences, CorrectionRuleStore, CredentialAccount, CredentialsVault,
-    DictionaryStore, HistoryStore, PreferencesStore, StylePackStore,
+    DictionaryStore, HistoryStore, PreferencesStore, StylePackStore, SyncSettingsStore,
+    SyncStateStore,
 };
 
 use crate::llm_gemini::{GeminiConfig, GeminiProvider};
@@ -164,6 +165,8 @@ struct Inner {
     style_packs: StylePackStore,
     vocab: DictionaryStore,
     correction_rules: CorrectionRuleStore,
+    sync_settings: SyncSettingsStore,
+    sync_state: SyncStateStore,
     inserter: TextInserter,
     #[cfg(target_os = "windows")]
     windows_ime: WindowsImeSessionController,
@@ -256,6 +259,8 @@ impl Coordinator {
             let style_packs = StylePackStore::new(&prefs).expect("style pack store init");
             let vocab = DictionaryStore::new().expect("dictionary store init");
             let correction_rules = CorrectionRuleStore::new().expect("correction rule store init");
+            let sync_settings = SyncSettingsStore::new().expect("sync settings store init");
+            let sync_state = SyncStateStore::new().expect("sync state store init");
 
             Self {
                 inner: Arc::new(Inner {
@@ -265,6 +270,8 @@ impl Coordinator {
                     style_packs,
                     vocab,
                     correction_rules,
+                    sync_settings,
+                    sync_state,
                     inserter: TextInserter::new(),
                     state: Mutex::new(SessionState::default()),
                     asr: Mutex::new(None),
@@ -304,6 +311,8 @@ impl Coordinator {
         let style_packs = StylePackStore::new(&prefs).expect("style pack store init");
         let vocab = DictionaryStore::new().expect("dictionary store init");
         let correction_rules = CorrectionRuleStore::new().expect("correction rule store init");
+        let sync_settings = SyncSettingsStore::new().expect("sync settings store init");
+        let sync_state = SyncStateStore::new().expect("sync state store init");
 
         Self {
             inner: Arc::new(Inner {
@@ -313,6 +322,8 @@ impl Coordinator {
                 style_packs,
                 vocab,
                 correction_rules,
+                sync_settings,
+                sync_state,
                 inserter: TextInserter::new(),
                 windows_ime: WindowsImeSessionController::new(),
                 prepared_windows_ime_session: Arc::new(Mutex::new(Vec::new())),
@@ -739,6 +750,12 @@ impl Coordinator {
     }
     pub fn correction_rules(&self) -> &CorrectionRuleStore {
         &self.inner.correction_rules
+    }
+    pub fn sync_settings(&self) -> &SyncSettingsStore {
+        &self.inner.sync_settings
+    }
+    pub fn sync_state(&self) -> &SyncStateStore {
+        &self.inner.sync_state
     }
 
     pub fn update_hotkey_binding(&self) {
@@ -1662,7 +1679,10 @@ fn sync_custom_dictation_to_plugin(inner: &Arc<Inner>) {
         return;
     }
     match crate::linux_fcitx::set_custom_dictation_trigger(&key_string) {
-        Ok(()) => log::info!("[fcitx] Synced custom dictation trigger '{}' to plugin", key_string),
+        Ok(()) => log::info!(
+            "[fcitx] Synced custom dictation trigger '{}' to plugin",
+            key_string
+        ),
         Err(e) => log::warn!("[fcitx] Failed to sync custom dictation trigger: {e}"),
     }
 }

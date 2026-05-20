@@ -16,7 +16,7 @@ use crate::coordinator::Coordinator;
 use crate::permissions::{self, PermissionStatus};
 use crate::persistence::{
     sync_style_pack_preferences, CredentialAccount, CredentialsSnapshot, CredentialsVault,
-    PreferencesStore,
+    PreferencesStore, SyncAuthVault,
 };
 use crate::polish::{
     http_client_builder, CodexOAuthConfig, CodexOAuthCredentials, CodexOAuthLLMProvider, LLMError,
@@ -28,8 +28,9 @@ use crate::types::{
     builtin_style_pack_id, default_active_style_pack_id, ChineseScriptPreference, ComboBinding,
     CorrectionRule, CredentialsStatus, DictationSession, DictionaryEntry, HotkeyCapability,
     HotkeyStatus, OutputLanguagePreference, PolishMode, ShortcutBinding, StylePack, StylePackKind,
-    StylePackRuntimeDiagnostics, StyleSystemPrompts, UpdateChannel, UserPreferences,
-    VocabPresetStore, WindowsImeStatus,
+    StylePackRuntimeDiagnostics, StyleSystemPrompts, SyncAuthSession, SyncChangeOperation,
+    SyncEntityKind, SyncSettings, SyncState, UpdateChannel, UserPreferences, VocabPresetStore,
+    WindowsImeStatus,
 };
 
 type CoordinatorState<'a> = State<'a, Arc<Coordinator>>;
@@ -467,10 +468,8 @@ async fn resolve_beta_manifest_endpoints() -> Result<Vec<url::Url>, String> {
     let direct = format!(
         "https://github.com/appergb/openless/releases/download/{tag}/latest-{{{{target}}}}-{{{{arch}}}}-beta.json"
     );
-    let mirror_url =
-        url::Url::parse(&mirror).map_err(|e| format!("parse beta mirror url: {e}"))?;
-    let direct_url =
-        url::Url::parse(&direct).map_err(|e| format!("parse beta direct url: {e}"))?;
+    let mirror_url = url::Url::parse(&mirror).map_err(|e| format!("parse beta mirror url: {e}"))?;
+    let direct_url = url::Url::parse(&direct).map_err(|e| format!("parse beta direct url: {e}"))?;
     Ok(vec![mirror_url, direct_url])
 }
 
@@ -1183,6 +1182,104 @@ fn parse_account(s: &str) -> Result<CredentialAccount, String> {
     }
 }
 
+// ───────────────────────── sync local state ───────────────────────────
+
+#[tauri::command]
+pub fn get_sync_settings(coord: CoordinatorState<'_>) -> SyncSettings {
+    coord.sync_settings().get()
+}
+
+#[tauri::command]
+pub fn set_sync_settings(
+    coord: CoordinatorState<'_>,
+    settings: SyncSettings,
+) -> Result<SyncSettings, String> {
+    coord
+        .sync_settings()
+        .set(settings)
+        .map_err(|e| e.to_string())?;
+    Ok(coord.sync_settings().get())
+}
+
+#[tauri::command]
+pub fn get_sync_state(coord: CoordinatorState<'_>) -> SyncState {
+    coord.sync_state().get()
+}
+
+#[tauri::command]
+pub fn update_sync_cursor(
+    coord: CoordinatorState<'_>,
+    cursor: Option<String>,
+    synced_at: Option<String>,
+) -> Result<SyncState, String> {
+    coord
+        .sync_state()
+        .update_cursor(cursor, synced_at)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_sync_last_error(
+    coord: CoordinatorState<'_>,
+    error: Option<String>,
+) -> Result<SyncState, String> {
+    coord
+        .sync_state()
+        .set_last_error(error)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn enqueue_sync_change(
+    coord: CoordinatorState<'_>,
+    entity: SyncEntityKind,
+    entity_id: String,
+    operation: SyncChangeOperation,
+) -> Result<SyncState, String> {
+    let change = crate::types::PendingSyncChange {
+        id: format!("change-{}", uuid::Uuid::new_v4().simple()),
+        entity,
+        entity_id,
+        operation,
+        queued_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+        last_error: None,
+    };
+    coord
+        .sync_state()
+        .enqueue(change)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn replace_sync_queue(
+    coord: CoordinatorState<'_>,
+    pending_changes: Vec<crate::types::PendingSyncChange>,
+) -> Result<SyncState, String> {
+    coord
+        .sync_state()
+        .replace_queue(pending_changes)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_sync_auth_session() -> Result<Option<SyncAuthSession>, String> {
+    SyncAuthVault::get().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_sync_auth_session(session: SyncAuthSession) -> Result<(), String> {
+    if session.account_email.trim().is_empty() || session.access_token.trim().is_empty() {
+        return Err("sync auth session is incomplete".into());
+    }
+    SyncAuthVault::set(&session).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_sync_auth_session() -> Result<(), String> {
+    SyncAuthVault::clear().map_err(|e| e.to_string())
+}
+
 // ─────────────────────────── history ───────────────────────────
 
 #[tauri::command]
@@ -1261,7 +1358,8 @@ fn is_valid_local_pack_id(s: &str) -> bool {
     if s.is_empty() || s.len() > 128 {
         return false;
     }
-    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
 }
 
 // ─────────────────────────── vocab ───────────────────────────
@@ -2472,8 +2570,10 @@ pub async fn marketplace_list(
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("marketplace HTTP {status}: {body}"));
     }
-    let items: Vec<MarketplaceListItem> =
-        resp.json().await.map_err(|e| format!("parse failed: {e}"))?;
+    let items: Vec<MarketplaceListItem> = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse failed: {e}"))?;
     Ok(items)
 }
 
@@ -2792,11 +2892,13 @@ fn get_github_oauth_client_id() -> Result<String, String> {
     if !GITHUB_OAUTH_CLIENT_ID.is_empty() {
         return Ok(GITHUB_OAUTH_CLIENT_ID.to_string());
     }
-    Err("GitHub OAuth 未配置。请去 https://github.com/settings/applications/new 注册一个 OAuth App\
+    Err(
+        "GitHub OAuth 未配置。请去 https://github.com/settings/applications/new 注册一个 OAuth App\
         （必须勾 Enable Device Flow），把 client_id 填到 \
         openless-all/app/src-tauri/src/commands.rs 的 GITHUB_OAUTH_CLIENT_ID 常量，\
         或在启动前设置环境变量 GITHUB_OAUTH_CLIENT_ID=<your_client_id>。"
-        .to_string())
+            .to_string(),
+    )
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3648,13 +3750,17 @@ mod tests {
         // 长度对但含 `/`：dash 位置错或非 hex 字符都不通过
         assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-44665544/000"));
         assert!(!is_valid_session_id("550e8400_e29b_41d4_a716_446655440000")); // 用 _ 代 -
-        // 非 hex 字符
+                                                                               // 非 hex 字符
         assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-44665544000g"));
         // 长度不对（35 / 37）
         assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-44665544000"));
-        assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-4466554400000"));
+        assert!(!is_valid_session_id(
+            "550e8400-e29b-41d4-a716-4466554400000"
+        ));
         // NUL 字节
-        assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-44665544\x00000"));
+        assert!(!is_valid_session_id(
+            "550e8400-e29b-41d4-a716-44665544\x00000"
+        ));
         // 百分号编码与绝对路径
         assert!(!is_valid_session_id("%2e%2e/recordings/x"));
         assert!(!is_valid_session_id("/Users/attacker/secret.wav"));
@@ -3665,7 +3771,9 @@ mod tests {
         assert!(is_valid_local_pack_id("builtin.light"));
         assert!(is_valid_local_pack_id("builtin.structured"));
         assert!(is_valid_local_pack_id("custom.meeting"));
-        assert!(is_valid_local_pack_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_valid_local_pack_id(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
         assert!(is_valid_local_pack_id("my_pack_v2"));
         assert!(is_valid_local_pack_id("Pack-2026.05"));
     }

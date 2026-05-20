@@ -1,6 +1,7 @@
 //! Shared value types crossing the IPC boundary.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -103,6 +104,114 @@ pub struct DictationSession {
     /// `None` / `Some(false)` 都按"无录音"处理；旧 JSON 不带这字段也兼容。
     #[serde(default)]
     pub has_audio_recording: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncEntityKind {
+    StylePack,
+    DictionaryEntry,
+    CorrectionRule,
+    VocabPreset,
+    ProviderConfig,
+    HistoryItem,
+    Preferences,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncChangeOperation {
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PendingSyncChange {
+    pub id: String,
+    pub entity: SyncEntityKind,
+    pub entity_id: String,
+    pub operation: SyncChangeOperation,
+    pub queued_at: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+impl Default for PendingSyncChange {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            entity: SyncEntityKind::StylePack,
+            entity_id: String::new(),
+            operation: SyncChangeOperation::Upsert,
+            queued_at: String::new(),
+            attempts: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SyncSettings {
+    pub enabled: bool,
+    pub server_url: String,
+    pub account_email: Option<String>,
+    pub device_name: String,
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: String::new(),
+            account_email: None,
+            device_name: default_sync_device_name(),
+        }
+    }
+}
+
+fn default_sync_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "OpenLess device".into())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SyncState {
+    pub device_id: String,
+    pub cursor: Option<String>,
+    pub last_sync_at: Option<String>,
+    pub last_push_at: Option<String>,
+    pub last_pull_at: Option<String>,
+    pub last_error: Option<String>,
+    pub pending_changes: Vec<PendingSyncChange>,
+}
+
+impl Default for SyncState {
+    fn default() -> Self {
+        Self {
+            device_id: format!("device-{}", Uuid::new_v4().simple()),
+            cursor: None,
+            last_sync_at: None,
+            last_push_at: None,
+            last_pull_at: None,
+            last_error: None,
+            pending_changes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SyncAuthSession {
+    pub account_email: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub access_token_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1514,14 +1623,16 @@ pub fn default_style_system_prompt_for_mode(mode: PolishMode) -> String {
     // 到这里只剩 Raw 一种模式（Light / Structured / Formal 都在上面 early-return 了）。
     // 仍用 match 把 _ 兜底为 unreachable!()，让编译期挡住未来加新 mode 时忘了在上面分流。
     let task_and_example = match mode {
-        PolishMode::Raw => "# 任务（原文）\n\
+        PolishMode::Raw => {
+            "# 任务（原文）\n\
             仅做最小化整理：补全标点、必要分句。\n\
             保留原话顺序、用词、语气；\u{4E0D}改写、\u{4E0D}扩写、\u{4E0D}重排。\n\
             可去除明显口癖（\u{55EF}、\u{554A}、那个、就是、you know），但\u{4E0D}改变信息密度。\n\
             \n\
             # 示例\n\
             原：\u{55EF}那个我刚刚跟客户聊完然后他说下周三可以给反馈\n\
-            出：我刚刚跟客户聊完，他说下周三可以给反馈。",
+            出：我刚刚跟客户聊完，他说下周三可以给反馈。"
+        }
 
         PolishMode::Light | PolishMode::Structured | PolishMode::Formal => {
             unreachable!("light/structured/formal handled by early return above")
