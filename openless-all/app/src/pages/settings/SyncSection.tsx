@@ -24,15 +24,19 @@ const tallInputStyle: CSSProperties = {
   height: 36,
   padding: '0 12px',
   fontSize: 13,
-  maxWidth: 420,
+  boxSizing: 'border-box',
+  maxWidth: 'none',
 };
 
 const tallButtonStyle: CSSProperties = {
+  height: 36,
   minHeight: 36,
-  padding: '0 14px',
+  padding: '0 12px',
   fontSize: 12.5,
   justifyContent: 'center',
   whiteSpace: 'nowrap',
+  boxSizing: 'border-box',
+  overflow: 'hidden',
 };
 
 const disabledMigrationButtonStyle: CSSProperties = {
@@ -270,27 +274,27 @@ export function SyncSection() {
               </Btn>
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 430 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 380 }}>
               <input
                 type="email"
                 value={email}
                 onChange={event => setEmail(event.target.value)}
                 placeholder="you@example.com"
-                style={tallInputStyle}
+                style={{ ...tallInputStyle, width: '100%' }}
               />
-              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) max-content max-content', gap: 8, width: '100%' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 116px 58px', gap: 8, width: '100%', minWidth: 0 }}>
                 <input
                   type="text"
                   inputMode="numeric"
                   value={code}
                   onChange={event => setCode(event.target.value)}
                   placeholder={t('settings.sync.codePlaceholder')}
-                  style={{ ...tallInputStyle, minWidth: 0, maxWidth: 'none' }}
+                  style={{ ...tallInputStyle, minWidth: 0, width: '100%' }}
                 />
-                <Btn size="sm" onClick={() => void requestCode()} disabled={busy !== null || !email.trim()} style={tallButtonStyle}>
+                <Btn size="sm" onClick={() => void requestCode()} disabled={busy !== null || !email.trim()} style={{ ...tallButtonStyle, width: '100%' }}>
                   {busy === 'code' ? t('settings.sync.sendingCode') : t('settings.sync.sendCode')}
                 </Btn>
-                <Btn size="sm" variant="blue" onClick={() => void verifyLogin()} disabled={busy !== null || !email.trim() || !code.trim()} style={tallButtonStyle}>
+                <Btn size="sm" variant="blue" onClick={() => void verifyLogin()} disabled={busy !== null || !email.trim() || !code.trim()} style={{ ...tallButtonStyle, width: '100%' }}>
                   {busy === 'login' ? t('settings.sync.loggingIn') : t('settings.sync.login')}
                 </Btn>
               </div>
