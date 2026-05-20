@@ -1359,16 +1359,17 @@ pub async fn sync_pull(coord: CoordinatorState<'_>) -> Result<SyncPullResult, Sy
     let cursor = coord.sync_state().get().cursor;
     let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
     let result = client.pull(cursor.as_deref()).await?;
-    coord
-        .sync_state()
-        .update_cursor(Some(result.cursor.clone()), Some(chrono::Utc::now().to_rfc3339()))
-        .map_err(|err| {
-            SyncApiError::local(
-                "sync_state_save_failed",
-                format!("同步状态保存失败：{err}"),
-                false,
-            )
-        })?;
+    let mut next_state = coord.sync_state().get();
+    next_state.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
+    next_state.last_pull_at = next_state.last_sync_at.clone();
+    next_state.last_error = None;
+    coord.sync_state().set(next_state).map_err(|err| {
+        SyncApiError::local(
+            "sync_state_save_failed",
+            format!("同步状态保存失败：{err}"),
+            false,
+        )
+    })?;
     Ok(result)
 }
 
