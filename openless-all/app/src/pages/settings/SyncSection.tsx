@@ -21,17 +21,18 @@ const DEFAULT_SYNC_SERVER_URL = 'https://sync.example.com';
 
 const tallInputStyle: CSSProperties = {
   ...inputStyle,
-  height: 44,
-  padding: '0 14px',
-  fontSize: 13.5,
+  height: 36,
+  padding: '0 12px',
+  fontSize: 13,
   maxWidth: 420,
 };
 
 const tallButtonStyle: CSSProperties = {
-  minHeight: 44,
-  padding: '0 16px',
-  fontSize: 13,
+  minHeight: 36,
+  padding: '0 14px',
+  fontSize: 12.5,
   justifyContent: 'center',
+  whiteSpace: 'nowrap',
 };
 
 const disabledMigrationButtonStyle: CSSProperties = {
@@ -269,7 +270,7 @@ export function SyncSection() {
               </Btn>
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: '100%', maxWidth: 420 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 430 }}>
               <input
                 type="email"
                 value={email}
@@ -277,7 +278,7 @@ export function SyncSection() {
                 placeholder="you@example.com"
                 style={tallInputStyle}
               />
-              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) auto auto', gap: 8, width: '100%' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) max-content max-content', gap: 8, width: '100%' }}>
                 <input
                   type="text"
                   inputMode="numeric"
