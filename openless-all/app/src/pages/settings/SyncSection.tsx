@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   getSyncAuthSession,
@@ -17,7 +17,29 @@ import { SettingRow, inputStyle } from './shared';
 
 type BusyAction = 'code' | 'login' | 'sync' | 'logout' | 'clear' | 'save' | null;
 
-const DEFAULT_SYNC_SERVER_URL = 'https://apic.openless.top';
+const DEFAULT_SYNC_SERVER_URL = 'https://sync.example.com';
+
+const tallInputStyle: CSSProperties = {
+  ...inputStyle,
+  height: 44,
+  padding: '0 14px',
+  fontSize: 13.5,
+  maxWidth: 420,
+};
+
+const tallButtonStyle: CSSProperties = {
+  minHeight: 44,
+  padding: '0 16px',
+  fontSize: 13,
+  justifyContent: 'center',
+};
+
+const disabledMigrationButtonStyle: CSSProperties = {
+  minHeight: 36,
+  padding: '0 14px',
+  fontSize: 12.5,
+  justifyContent: 'center',
+};
 
 export function SyncSection() {
   const { t } = useTranslation();
@@ -35,6 +57,7 @@ export function SyncSection() {
   const loggedInEmail = session?.accountEmail || settings?.accountEmail || null;
   const isLoggedIn = Boolean(session?.accessToken && loggedInEmail);
   const pendingCount = state?.pendingChanges.length ?? 0;
+  const effectiveServerUrl = () => serverUrl.trim() || DEFAULT_SYNC_SERVER_URL;
 
   const lastSyncText = useMemo(() => {
     const value = state?.lastSyncAt ?? state?.lastPullAt ?? state?.lastPushAt ?? null;
@@ -91,7 +114,7 @@ export function SyncSection() {
     try {
       const next = await setSyncSettings({
         ...settings,
-        serverUrl: serverUrl.trim(),
+        serverUrl: effectiveServerUrl(),
         deviceName: deviceName.trim() || settings.deviceName,
         accountEmail: loggedInEmail,
       });
@@ -114,7 +137,7 @@ export function SyncSection() {
     try {
       const nextSettings = await setSyncSettings({
         ...settings,
-        serverUrl: serverUrl.trim(),
+        serverUrl: effectiveServerUrl(),
         deviceName: deviceName.trim() || settings.deviceName,
         accountEmail: email.trim() || null,
       });
@@ -136,7 +159,7 @@ export function SyncSection() {
     try {
       const nextSettings = await setSyncSettings({
         ...settings,
-        serverUrl: serverUrl.trim(),
+        serverUrl: effectiveServerUrl(),
         deviceName: deviceName.trim() || settings.deviceName,
         accountEmail: email.trim() || null,
       });
@@ -221,16 +244,6 @@ export function SyncSection() {
           <Pill tone={isLoggedIn ? 'ok' : 'outline'}>{isLoggedIn ? t('settings.sync.signedIn') : t('settings.sync.signedOut')}</Pill>
         </div>
 
-        <SettingRow label={t('settings.sync.serverUrlLabel')} desc={t('settings.sync.serverUrlDesc')}>
-          <input
-            type="url"
-            value={serverUrl}
-            onChange={event => setServerUrl(event.target.value)}
-            placeholder={DEFAULT_SYNC_SERVER_URL}
-            style={{ ...inputStyle, maxWidth: 300 }}
-          />
-        </SettingRow>
-
         <SettingRow label={t('settings.sync.deviceNameLabel')} desc={t('settings.sync.deviceNameDesc')}>
           <div style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 380 }}>
             <input
@@ -251,32 +264,32 @@ export function SyncSection() {
               <span style={{ fontSize: 12.5, color: 'var(--ol-ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {loggedInEmail}
               </span>
-              <Btn size="sm" onClick={() => void logout()} disabled={busy !== null}>
+              <Btn size="sm" onClick={() => void logout()} disabled={busy !== null} style={tallButtonStyle}>
                 {busy === 'logout' ? t('settings.sync.loggingOut') : t('settings.sync.logout')}
               </Btn>
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 380 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: '100%', maxWidth: 420 }}>
               <input
                 type="email"
                 value={email}
                 onChange={event => setEmail(event.target.value)}
                 placeholder="you@example.com"
-                style={inputStyle}
+                style={tallInputStyle}
               />
-              <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) auto auto', gap: 8, width: '100%' }}>
                 <input
                   type="text"
                   inputMode="numeric"
                   value={code}
                   onChange={event => setCode(event.target.value)}
                   placeholder={t('settings.sync.codePlaceholder')}
-                  style={{ ...inputStyle, maxWidth: 150 }}
+                  style={{ ...tallInputStyle, minWidth: 0, maxWidth: 'none' }}
                 />
-                <Btn size="sm" onClick={() => void requestCode()} disabled={busy !== null || !email.trim()}>
+                <Btn size="sm" onClick={() => void requestCode()} disabled={busy !== null || !email.trim()} style={tallButtonStyle}>
                   {busy === 'code' ? t('settings.sync.sendingCode') : t('settings.sync.sendCode')}
                 </Btn>
-                <Btn size="sm" variant="blue" onClick={() => void verifyLogin()} disabled={busy !== null || !email.trim() || !code.trim()}>
+                <Btn size="sm" variant="blue" onClick={() => void verifyLogin()} disabled={busy !== null || !email.trim() || !code.trim()} style={tallButtonStyle}>
                   {busy === 'login' ? t('settings.sync.loggingIn') : t('settings.sync.login')}
                 </Btn>
               </div>
@@ -303,6 +316,41 @@ export function SyncSection() {
           <Btn size="sm" onClick={() => void clearCloud()} disabled={!isLoggedIn || busy !== null}>
             {busy === 'clear' ? t('settings.sync.clearing') : t('settings.sync.clearCloud')}
           </Btn>
+        </SettingRow>
+      </Card>
+
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{t('settings.sync.advancedTitle')}</div>
+        <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginBottom: 6, lineHeight: 1.5 }}>{t('settings.sync.advancedDesc')}</div>
+        <SettingRow label={t('settings.sync.serverUrlLabel')} desc={t('settings.sync.serverUrlDesc')}>
+          <div style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 520 }}>
+            <input
+              type="url"
+              value={serverUrl}
+              onChange={event => setServerUrl(event.target.value)}
+              placeholder={DEFAULT_SYNC_SERVER_URL}
+              style={{ ...tallInputStyle, minWidth: 0, maxWidth: 'none' }}
+            />
+            <Btn size="sm" onClick={() => void saveSettings()} disabled={busy !== null} style={tallButtonStyle}>
+              {busy === 'save' ? t('common.saving') : t('settings.sync.saveSettings')}
+            </Btn>
+          </div>
+        </SettingRow>
+        <SettingRow label={t('settings.sync.migrationLabel')} desc={t('settings.sync.migrationDesc')}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              <Btn size="sm" disabled style={disabledMigrationButtonStyle}>
+                {t('settings.sync.migrationExport')}
+              </Btn>
+              <Btn size="sm" disabled style={disabledMigrationButtonStyle}>
+                {t('settings.sync.migrationReupload')}
+              </Btn>
+              <Btn size="sm" disabled style={disabledMigrationButtonStyle}>
+                {t('settings.sync.migrationImport')}
+              </Btn>
+            </div>
+            <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', lineHeight: 1.5 }}>{t('settings.sync.migrationComingSoon')}</div>
+          </div>
         </SettingRow>
       </Card>
 

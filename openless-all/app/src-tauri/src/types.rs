@@ -164,7 +164,7 @@ impl Default for SyncSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            server_url: String::new(),
+            server_url: "https://sync.example.com".to_string(),
             account_email: None,
             device_name: default_sync_device_name(),
         }
