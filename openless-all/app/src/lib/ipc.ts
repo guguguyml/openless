@@ -26,7 +26,14 @@ import type {
   PendingSyncChange,
   SyncAuthSession,
   SyncChangeOperation,
+  SyncClearCloudDataResult,
   SyncEntityKind,
+  SyncEmailCodeRequestResult,
+  SyncLoginResult,
+  SyncOkResult,
+  SyncPullResult,
+  SyncPushChanges,
+  SyncPushResult,
   SyncSettings,
   SyncState,
   UpdateChannel,
@@ -473,6 +480,15 @@ let mockSyncState: SyncState = {
 
 let mockSyncAuthSession: SyncAuthSession | null = null;
 
+const emptySyncChanges = (): SyncPushChanges => ({
+  prompts: [],
+  providerConfigs: [],
+  historyItems: [],
+  dictionaryEntries: [],
+  correctionRules: [],
+  vocabPresets: [],
+});
+
 // ── Settings ───────────────────────────────────────────────────────────
 export function getSettings(): Promise<UserPreferences> {
   return invokeOrMock('get_settings', undefined, () => ({ ...mockSettings }));
@@ -673,6 +689,88 @@ export function clearSyncAuthSession(): Promise<void> {
   return invokeOrMock('clear_sync_auth_session', undefined, () => {
     mockSyncAuthSession = null;
     return undefined;
+  });
+}
+
+export function syncRequestEmailCode(email: string): Promise<SyncEmailCodeRequestResult> {
+  return invokeOrMock('sync_request_email_code', { email }, () => ({ ok: true, expiresIn: 300 }));
+}
+
+export function syncVerifyEmailCode(email: string, code: string): Promise<SyncLoginResult> {
+  return invokeOrMock('sync_verify_email_code', { email, code }, () => {
+    mockSyncAuthSession = {
+      accountEmail: email,
+      accessToken: 'mock-sync-token',
+      refreshToken: 'mock-sync-refresh-token',
+      accessTokenExpiresAt: null,
+    };
+    mockSyncSettings = {
+      ...mockSyncSettings,
+      enabled: true,
+      accountEmail: email,
+    };
+    return {
+      user: { id: 'mock-user', email },
+      accountEmail: email,
+    };
+  });
+}
+
+export function syncPull(): Promise<SyncPullResult> {
+  return invokeOrMock('sync_pull', undefined, () => {
+    const now = new Date().toISOString();
+    mockSyncState = {
+      ...mockSyncState,
+      cursor: '1',
+      lastSyncAt: now,
+      lastPullAt: now,
+      lastError: null,
+    };
+    return {
+      cursor: '1',
+      serverTime: now,
+      ...emptySyncChanges(),
+    };
+  });
+}
+
+export function syncPush(changes: SyncPushChanges): Promise<SyncPushResult> {
+  return invokeOrMock('sync_push', { changes }, () => {
+    const now = new Date().toISOString();
+    mockSyncState = {
+      ...mockSyncState,
+      cursor: '2',
+      lastSyncAt: now,
+      lastPushAt: now,
+      lastError: null,
+    };
+    return { ok: true, cursor: '2', conflictsResolved: 0 };
+  });
+}
+
+export function syncLogoutDevice(): Promise<SyncOkResult> {
+  return invokeOrMock('sync_logout_device', undefined, () => {
+    mockSyncAuthSession = null;
+    mockSyncSettings = {
+      ...mockSyncSettings,
+      enabled: false,
+      accountEmail: null,
+    };
+    return { ok: true };
+  });
+}
+
+export function syncClearCloudData(): Promise<SyncClearCloudDataResult> {
+  return invokeOrMock('sync_clear_cloud_data', undefined, () => {
+    const now = new Date().toISOString();
+    mockSyncState = {
+      ...mockSyncState,
+      cursor: null,
+      lastSyncAt: now,
+      lastPullAt: now,
+      lastError: null,
+    };
+    return { ok: true, deletedAt: now };
   });
 }
 

@@ -31,6 +31,7 @@ mod qa_hotkey;
 mod recorder;
 mod selection;
 mod shortcut_binding;
+mod sync_client;
 mod types;
 mod unicode_keystroke;
 mod windows_ime_ipc;
@@ -298,6 +299,12 @@ pub fn run() {
             commands::get_sync_auth_session,
             commands::set_sync_auth_session,
             commands::clear_sync_auth_session,
+            commands::sync_request_email_code,
+            commands::sync_verify_email_code,
+            commands::sync_pull,
+            commands::sync_push,
+            commands::sync_logout_device,
+            commands::sync_clear_cloud_data,
             commands::list_history,
             commands::delete_history_entry,
             commands::clear_history,

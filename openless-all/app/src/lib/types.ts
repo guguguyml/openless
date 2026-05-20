@@ -68,6 +68,57 @@ export interface SyncAuthSession {
   accessTokenExpiresAt: string | null;
 }
 
+export interface SyncApiError {
+  code: string;
+  message: string;
+  status: number | null;
+  retryable: boolean;
+}
+
+export interface SyncEmailCodeRequestResult {
+  ok: boolean;
+  expiresIn: number;
+}
+
+export interface SyncUserInfo {
+  id: string;
+  email: string;
+}
+
+export interface SyncLoginResult {
+  user: SyncUserInfo;
+  accountEmail: string;
+}
+
+export interface SyncPushChanges {
+  prompts: Record<string, unknown>[];
+  providerConfigs: Record<string, unknown>[];
+  historyItems: Record<string, unknown>[];
+  dictionaryEntries: Record<string, unknown>[];
+  correctionRules: Record<string, unknown>[];
+  vocabPresets: Record<string, unknown>[];
+}
+
+export interface SyncPullResult extends SyncPushChanges {
+  cursor: string;
+  serverTime: string;
+}
+
+export interface SyncPushResult {
+  ok: boolean;
+  cursor: string;
+  conflictsResolved: number;
+}
+
+export interface SyncOkResult {
+  ok: boolean;
+}
+
+export interface SyncClearCloudDataResult {
+  ok: boolean;
+  deletedAt: string;
+}
+
 export interface DictionaryEntry {
   id: string;
   phrase: string;
