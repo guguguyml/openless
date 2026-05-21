@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1373,6 +1373,21 @@ impl StylePackStore {
         Ok(updated)
     }
 
+    pub fn apply_synced_style_pack(&self, incoming: StylePack) -> Result<StylePack> {
+        let incoming = normalize_synced_style_pack(incoming)?;
+        let mut packs = self.state.lock();
+        if let Some(index) = packs.iter().position(|pack| pack.id == incoming.id) {
+            if !synced_style_pack_is_newer(&packs[index], &incoming)? {
+                return Ok(packs[index].clone());
+            }
+            packs[index] = incoming.clone();
+        } else {
+            packs.push(incoming.clone());
+        }
+        write_style_packs_file(&self.path, &packs)?;
+        Ok(incoming)
+    }
+
     /// 设置衍生关系；marketplace_install 安装本地包后绑定 upstream id + author。
     /// 单独走这里是为了不让前端通用 save 路径误清这两字段。
     pub fn set_origin(
@@ -1866,6 +1881,54 @@ fn merge_style_pack_update(existing: StylePack, incoming: StylePack) -> Result<S
     // ——否则前端 save 时丢失 originPackId 就会清掉关联。要写 origin 走专用的 set_origin。
     updated.updated_at = Some(Utc::now().to_rfc3339());
     Ok(updated)
+}
+
+fn normalize_synced_style_pack(mut incoming: StylePack) -> Result<StylePack> {
+    incoming.id = normalize_required_text(&incoming.id, "style pack id")?;
+    incoming.name = normalize_required_text(&incoming.name, "style pack name")?;
+    if incoming.kind == StylePackKind::Builtin {
+        return Err(anyhow!("builtin style pack cannot be synced"));
+    }
+    let updated_at = incoming
+        .updated_at
+        .clone()
+        .ok_or_else(|| anyhow!("synced style pack updated_at is required"))?;
+    parse_rfc3339(&updated_at, "synced style pack updated_at")?;
+    incoming.description = incoming.description.trim().to_string();
+    incoming.author = normalize_optional_text(incoming.author);
+    incoming.version = normalize_version(&incoming.version);
+    incoming.examples = normalize_examples(incoming.examples);
+    incoming.tags = normalize_tags(&incoming.tags);
+    incoming.icon_path = normalize_optional_text(incoming.icon_path);
+    incoming.created_at = incoming
+        .created_at
+        .and_then(|value| normalize_optional_text(Some(value)))
+        .or_else(|| Some(updated_at.clone()));
+    incoming.updated_at = Some(updated_at);
+    incoming.active = false;
+    incoming.recommended_model = normalize_optional_text(incoming.recommended_model);
+    incoming.compatible_app_version = normalize_optional_text(incoming.compatible_app_version);
+    incoming.origin_pack_id = normalize_optional_text(incoming.origin_pack_id);
+    incoming.origin_author_login = normalize_optional_text(incoming.origin_author_login);
+    Ok(incoming)
+}
+
+fn synced_style_pack_is_newer(existing: &StylePack, incoming: &StylePack) -> Result<bool> {
+    let incoming_updated_at = parse_rfc3339(
+        incoming
+            .updated_at
+            .as_deref()
+            .ok_or_else(|| anyhow!("synced style pack updated_at is required"))?,
+        "synced style pack updated_at",
+    )?;
+    let Some(existing_updated_at) = existing.updated_at.as_deref() else {
+        return Ok(true);
+    };
+    Ok(incoming_updated_at >= parse_rfc3339(existing_updated_at, "local style pack updated_at")?)
+}
+
+fn parse_rfc3339(value: &str, field: &str) -> Result<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(value).with_context(|| format!("{field} is invalid"))
 }
 
 fn normalize_examples(examples: Vec<StylePackExample>) -> Vec<StylePackExample> {
@@ -2438,13 +2501,14 @@ impl SyncAuthVault {
 mod tests {
     use super::{
         chunk_json_payload, list_vocab_presets, read_preferences, save_vocab_presets,
-        sync_style_pack_preferences, validate_correction_rule_syntax, SyncStateStore,
-        KEYRING_CHUNK_MAX_UTF16_UNITS,
+        sync_style_pack_preferences, validate_correction_rule_syntax, StylePackStore,
+        SyncStateStore, KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
     use crate::types::{
-        builtin_style_packs, CustomStylePrompts, PendingSyncChange, SyncChangeOperation,
-        SyncEntityKind, VocabPreset, VocabPresetStore,
+        builtin_style_packs, CustomStylePrompts, PendingSyncChange, PolishMode, StylePack,
+        StylePackKind, SyncChangeOperation, SyncEntityKind, VocabPreset, VocabPresetStore,
     };
+    use parking_lot::Mutex;
     use std::fs;
     use std::path::PathBuf;
 
@@ -2569,6 +2633,76 @@ mod tests {
     }
 
     #[test]
+    fn synced_style_pack_keeps_marketplace_copies_with_different_local_ids() {
+        let (tmp, store) = temp_style_pack_store("origin-copies");
+        store
+            .apply_synced_style_pack(synced_style_pack(
+                "local-a",
+                "Shared pack",
+                "2026-05-21T00:00:01Z",
+                Some("market-pack-1"),
+                Some("alice"),
+            ))
+            .expect("apply first copy");
+        store
+            .apply_synced_style_pack(synced_style_pack(
+                "local-b",
+                "Shared pack",
+                "2026-05-21T00:00:02Z",
+                Some("market-pack-1"),
+                Some("alice"),
+            ))
+            .expect("apply second copy");
+
+        let packs = store.list().expect("list packs");
+        assert_eq!(packs.len(), 2);
+        assert!(packs.iter().any(|pack| pack.id == "local-a"));
+        assert!(packs.iter().any(|pack| pack.id == "local-b"));
+        assert!(packs
+            .iter()
+            .all(|pack| pack.origin_pack_id.as_deref() == Some("market-pack-1")));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn synced_style_pack_uses_updated_at_for_same_id_conflicts() {
+        let (tmp, store) = temp_style_pack_store("same-id");
+        store
+            .apply_synced_style_pack(synced_style_pack(
+                "local-a",
+                "Old name",
+                "2026-05-21T00:00:01Z",
+                Some("market-pack-1"),
+                Some("alice"),
+            ))
+            .expect("apply old pack");
+        store
+            .apply_synced_style_pack(synced_style_pack(
+                "local-a",
+                "New name",
+                "2026-05-21T00:00:03Z",
+                Some("market-pack-1"),
+                Some("alice"),
+            ))
+            .expect("apply new pack");
+        store
+            .apply_synced_style_pack(synced_style_pack(
+                "local-a",
+                "Stale name",
+                "2026-05-21T00:00:02Z",
+                Some("market-pack-1"),
+                Some("alice"),
+            ))
+            .expect("ignore stale pack");
+
+        let pack = store.get("local-a").expect("get pack");
+        assert_eq!(pack.name, "New name");
+        assert_eq!(pack.updated_at.as_deref(), Some("2026-05-21T00:00:03Z"));
+        assert!(!pack.active);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn correction_rule_syntax_rejects_silent_noops() {
         assert!(validate_correction_rule_syntax("{num}粒", "{num}例").is_ok());
         assert!(validate_correction_rule_syntax("几粒", "几例").is_ok());
@@ -2611,5 +2745,49 @@ mod tests {
         assert_eq!(prefs.style_system_prompts.structured, packs[2].prompt);
         assert_eq!(prefs.style_system_prompts.formal, packs[3].prompt);
         assert_eq!(prefs.custom_style_prompts, CustomStylePrompts::default());
+    }
+
+    fn temp_style_pack_store(name: &str) -> (PathBuf, StylePackStore) {
+        let tmp = std::env::temp_dir().join(format!(
+            "openless-style-pack-sync-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(tmp.join("assets")).expect("create temp store");
+        let store = StylePackStore {
+            path: tmp.join("style-packs.json"),
+            asset_root: tmp.join("assets"),
+            state: Mutex::new(Vec::new()),
+        };
+        (tmp, store)
+    }
+
+    fn synced_style_pack(
+        id: &str,
+        name: &str,
+        updated_at: &str,
+        origin_pack_id: Option<&str>,
+        origin_author_login: Option<&str>,
+    ) -> StylePack {
+        StylePack {
+            id: id.into(),
+            name: name.into(),
+            description: "Marketplace copy".into(),
+            author: None,
+            version: "1.0.0".into(),
+            kind: StylePackKind::Imported,
+            base_mode: PolishMode::Light,
+            prompt: "Rewrite clearly.".into(),
+            examples: Vec::new(),
+            tags: vec!["marketplace".into()],
+            icon_path: Some("market-icon.png".into()),
+            created_at: Some("2026-05-21T00:00:00Z".into()),
+            updated_at: Some(updated_at.into()),
+            enabled: true,
+            active: true,
+            recommended_model: None,
+            compatible_app_version: None,
+            origin_pack_id: origin_pack_id.map(str::to_string),
+            origin_author_login: origin_author_login.map(str::to_string),
+        }
     }
 }

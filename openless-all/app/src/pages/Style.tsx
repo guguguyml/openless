@@ -1067,7 +1067,14 @@ export function Style() {
                       <Pill tone="default" size="sm">{draft.id}</Pill>
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10 }}>
-                      <MetaItem label={t('style.pack.metaSource')} value={draft.kind === 'builtin' ? t('style.pack.builtin') : t('style.pack.imported')} />
+                      <MetaItem
+                        label={t('style.pack.metaSource')}
+                        value={
+                          draft.kind === 'builtin'
+                            ? t('style.pack.builtin')
+                            : [t('style.pack.imported'), draft.originAuthorLogin || draft.originPackId].filter(Boolean).join(' · ')
+                        }
+                      />
                       <MetaItem label={t('style.pack.metaBaseMode')} value={t(`style.modes.${draft.baseMode}.name`)} />
                       <MetaItem label={t('style.pack.metaUpdatedAt')} value={draft.updatedAt || '—'} />
                     </div>

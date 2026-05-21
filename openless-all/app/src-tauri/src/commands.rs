@@ -1396,6 +1396,7 @@ pub async fn sync_pull(coord: CoordinatorState<'_>) -> Result<SyncPullResult, Sy
     let cursor = coord.sync_state().get().cursor;
     let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
     let result = client.pull(cursor.as_deref()).await?;
+    apply_pulled_style_packs(&coord, &result)?;
     let mut next_state = coord.sync_state().get();
     next_state.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
     next_state.last_pull_at = next_state.last_sync_at.clone();
@@ -1408,6 +1409,32 @@ pub async fn sync_pull(coord: CoordinatorState<'_>) -> Result<SyncPullResult, Sy
         )
     })?;
     Ok(result)
+}
+
+fn apply_pulled_style_packs(
+    coord: &Coordinator,
+    result: &SyncPullResult,
+) -> Result<(), SyncApiError> {
+    for value in &result.prompts {
+        let pack = serde_json::from_value::<StylePack>(value.clone()).map_err(|err| {
+            SyncApiError::local(
+                "sync_style_pack_invalid",
+                format!("同步服务返回的风格包数据无法识别：{err}"),
+                false,
+            )
+        })?;
+        coord
+            .style_packs()
+            .apply_synced_style_pack(pack)
+            .map_err(|err| {
+                SyncApiError::local(
+                    "sync_style_pack_apply_failed",
+                    format!("同步风格包写入本地失败：{err}"),
+                    false,
+                )
+            })?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
