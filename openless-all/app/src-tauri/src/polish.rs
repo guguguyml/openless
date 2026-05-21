@@ -2881,6 +2881,28 @@ mod tests {
     }
 
     #[test]
+    fn compose_polish_prompts_uses_style_pack_prompt_as_system_prompt_base() {
+        let style_pack_prompt = "只用三条短句输出。\n{{HOTWORDS}}\n不要写寒暄。";
+        let (system_prompt, user_prompt) = compose_polish_prompts(
+            "帮我整理一下这个 PR 说明",
+            PolishMode::Formal,
+            &["OpenLess".into()],
+            style_pack_prompt,
+            &[],
+            ChineseScriptPreference::Auto,
+            OutputLanguagePreference::Auto,
+            None,
+            false,
+        );
+
+        assert!(system_prompt.contains("只用三条短句输出。"));
+        assert!(system_prompt.contains("不要写寒暄。"));
+        assert!(system_prompt.contains("- OpenLess"));
+        assert!(!system_prompt.contains("{{HOTWORDS}}"));
+        assert!(user_prompt.contains("帮我整理一下这个 PR 说明"));
+    }
+
+    #[test]
     fn common_rules_include_auto_correction_and_natural_organization() {
         // 只有 Raw 仍走标准 ROLE_BLOCK / COMMON_RULES / OUTPUT_BLOCK wrapper。
         // Light / Structured / Formal 已切到 v2 PRO 自带 prompt（含独立 ASR 纠错 + 分级策略）。
