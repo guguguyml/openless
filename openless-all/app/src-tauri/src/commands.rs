@@ -1391,16 +1391,25 @@ pub async fn sync_verify_email_code(
 
 #[tauri::command]
 pub async fn sync_pull(coord: CoordinatorState<'_>) -> Result<SyncPullResult, SyncApiError> {
+    let result = sync_pull_inner(&coord).await;
+    if let Err(error) = &result {
+        record_sync_pull_error(&coord, error);
+    }
+    result
+}
+
+async fn sync_pull_inner(coord: &Coordinator) -> Result<SyncPullResult, SyncApiError> {
     let settings = coord.sync_settings().get();
     let session = require_sync_auth_session()?;
     let cursor = coord.sync_state().get().cursor;
     let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
     let result = client.pull(cursor.as_deref()).await?;
-    apply_pulled_style_packs(&coord, &result)?;
-    let mut next_state = coord.sync_state().get();
-    next_state.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
-    next_state.last_pull_at = next_state.last_sync_at.clone();
-    next_state.last_error = None;
+    apply_pulled_style_packs(coord, &result)?;
+    let next_state = successful_pull_state(
+        coord.sync_state().get(),
+        &result.cursor,
+        chrono::Utc::now().to_rfc3339(),
+    );
     coord.sync_state().set(next_state).map_err(|err| {
         SyncApiError::local(
             "sync_state_save_failed",
@@ -1409,6 +1418,30 @@ pub async fn sync_pull(coord: CoordinatorState<'_>) -> Result<SyncPullResult, Sy
         )
     })?;
     Ok(result)
+}
+
+fn record_sync_pull_error(coord: &Coordinator, error: &SyncApiError) {
+    let state = failed_pull_state(coord.sync_state().get(), error);
+    if let Err(save_error) = coord.sync_state().set(state) {
+        log::warn!("[sync] save pull error failed: {save_error}");
+    }
+}
+
+fn successful_pull_state(mut state: SyncState, cursor: &str, synced_at: String) -> SyncState {
+    state.cursor = if cursor.trim().is_empty() {
+        None
+    } else {
+        Some(cursor.to_string())
+    };
+    state.last_sync_at = Some(synced_at.clone());
+    state.last_pull_at = Some(synced_at);
+    state.last_error = None;
+    state
+}
+
+fn failed_pull_state(mut state: SyncState, error: &SyncApiError) -> SyncState {
+    state.last_error = Some(error.to_string());
+    state
 }
 
 fn apply_pulled_style_packs(
@@ -3328,16 +3361,18 @@ pub async fn github_device_flow_poll(
 mod tests {
     use super::{
         active_asr_is_keyless_for_validation, active_foundry_model_from_prefs,
-        asr_configured_for_provider, asr_transcriptions_url, fetch_provider_models,
-        is_gemini_base_url, is_valid_local_pack_id, is_valid_session_id,
+        asr_configured_for_provider, asr_transcriptions_url, failed_pull_state,
+        fetch_provider_models, is_gemini_base_url, is_valid_local_pack_id, is_valid_session_id,
         llm_configured_for_provider, local_asr_release_plan_for_provider, models_url,
         normalize_foundry_language_hint, parse_gemini_model_ids, parse_latest_beta_from_atom,
         parse_model_ids, persist_settings, release_foundry_runtime_if_inactive,
-        validate_foundry_model_alias, ProviderConfig, SettingsWriter,
+        successful_pull_state, validate_foundry_model_alias, ProviderConfig, SettingsWriter,
     };
     use crate::persistence::CredentialsSnapshot;
+    use crate::sync_client::SyncApiError;
     use crate::types::{
-        ComboBinding, HotkeyBinding, HotkeyMode, HotkeyTrigger, ShortcutBinding, UserPreferences,
+        ComboBinding, HotkeyBinding, HotkeyMode, HotkeyTrigger, ShortcutBinding, SyncState,
+        UserPreferences,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -4091,6 +4126,39 @@ mod tests {
         // 百分号编码与绝对路径
         assert!(!is_valid_session_id("%2e%2e/recordings/x"));
         assert!(!is_valid_session_id("/Users/attacker/secret.wav"));
+    }
+
+    #[test]
+    fn successful_pull_state_saves_cursor_and_clears_last_error() {
+        let state = SyncState {
+            cursor: Some("old-cursor".into()),
+            last_error: Some("previous error".into()),
+            ..Default::default()
+        };
+
+        let next = successful_pull_state(state, "cursor-31", "2026-05-21T00:00:00Z".into());
+
+        assert_eq!(next.cursor.as_deref(), Some("cursor-31"));
+        assert_eq!(next.last_sync_at.as_deref(), Some("2026-05-21T00:00:00Z"));
+        assert_eq!(next.last_pull_at.as_deref(), Some("2026-05-21T00:00:00Z"));
+        assert_eq!(next.last_error, None);
+    }
+
+    #[test]
+    fn failed_pull_state_preserves_cursor_and_records_error() {
+        let state = SyncState {
+            cursor: Some("cursor-30".into()),
+            ..Default::default()
+        };
+        let error = SyncApiError::local("sync_network_failed", "network unavailable", true);
+
+        let next = failed_pull_state(state, &error);
+
+        assert_eq!(next.cursor.as_deref(), Some("cursor-30"));
+        assert_eq!(
+            next.last_error.as_deref(),
+            Some("sync_network_failed: network unavailable")
+        );
     }
 
     #[test]

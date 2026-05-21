@@ -5,6 +5,7 @@ import {
 	getSyncSettings,
 	getSyncState,
 	setSyncSettings,
+	setSyncLastError,
 	syncClearCloudData,
 	syncLogoutDevice,
 	syncPull,
@@ -139,8 +140,19 @@ export function SyncSection() {
 			});
 			setSettings(nextSettings);
 			const result = await syncVerifyEmailCode(email.trim(), code.trim());
-			setMessage(t("settings.sync.loginSuccess", { email: result.accountEmail }));
+			const loginMessage = t("settings.sync.loginSuccess", { email: result.accountEmail });
+			setMessage(loginMessage);
 			setCode("");
+			try {
+				const pullResult = await syncPull();
+				setMessage(`${loginMessage} ${t("settings.sync.syncSuccess", { cursor: pullResult.cursor || "0" })}`);
+			} catch (pullError) {
+				const formatted = formatSyncError(pullError);
+				await setSyncLastError(formatted).catch(error => {
+					console.warn("[sync] save login pull error failed", error);
+				});
+				setError(formatted);
+			}
 			await refresh();
 		} catch (err) {
 			setError(formatSyncError(err));

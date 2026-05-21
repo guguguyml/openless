@@ -9,8 +9,10 @@ import {
   checkMicrophonePermission,
   getHotkeyStatus,
   getSettings,
+  getSyncAuthSession,
   handleWindowHotkeyEvent,
   isTauri,
+  syncPull,
 } from './lib/ipc';
 import {
   isWindowHotkeyKeyboardCandidate,
@@ -37,6 +39,19 @@ export function App({ isCapsule, isQa }: AppProps) {
   const os = detectOS();
   // Windows 启动不应被权限探测阻塞首屏。
   const [gate, setGate] = useState<Gate>(isTauri ? 'checking' : 'ready');
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    void (async () => {
+      const session = await getSyncAuthSession();
+      if (cancelled || !session?.accessToken) return;
+      await syncPull();
+    })().catch(error => console.warn('[sync] startup pull failed', error));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isTauri) return;
