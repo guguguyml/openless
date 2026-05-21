@@ -303,6 +303,7 @@ pub fn run() {
             commands::sync_verify_email_code,
             commands::sync_pull,
             commands::sync_push,
+            commands::sync_push_pending,
             commands::sync_logout_device,
             commands::sync_clear_cloud_data,
             commands::list_history,

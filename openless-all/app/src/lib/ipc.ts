@@ -748,6 +748,21 @@ export function syncPush(changes: SyncPushChanges): Promise<SyncPushResult> {
   });
 }
 
+export function syncPushPending(): Promise<SyncPushResult> {
+  return invokeOrMock('sync_push_pending', undefined, () => {
+    const now = new Date().toISOString();
+    mockSyncState = {
+      ...mockSyncState,
+      cursor: mockSyncState.pendingChanges.length ? '2' : mockSyncState.cursor,
+      lastSyncAt: mockSyncState.pendingChanges.length ? now : mockSyncState.lastSyncAt,
+      lastPushAt: mockSyncState.pendingChanges.length ? now : mockSyncState.lastPushAt,
+      lastError: null,
+      pendingChanges: [],
+    };
+    return { ok: true, cursor: mockSyncState.cursor ?? '', conflictsResolved: 0 };
+  });
+}
+
 export function syncLogoutDevice(): Promise<SyncOkResult> {
   return invokeOrMock('sync_logout_device', undefined, () => {
     mockSyncAuthSession = null;

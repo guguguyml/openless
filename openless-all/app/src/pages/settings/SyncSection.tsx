@@ -9,6 +9,7 @@ import {
 	syncClearCloudData,
 	syncLogoutDevice,
 	syncPull,
+	syncPushPending,
 	syncRequestEmailCode,
 	syncVerifyEmailCode,
 } from "../../lib/ipc";
@@ -145,6 +146,7 @@ export function SyncSection() {
 			setCode("");
 			try {
 				const pullResult = await syncPull();
+				await syncPushPending();
 				setMessage(`${loginMessage} ${t("settings.sync.syncSuccess", { cursor: pullResult.cursor || "0" })}`);
 			} catch (pullError) {
 				const formatted = formatSyncError(pullError);
@@ -168,8 +170,9 @@ export function SyncSection() {
 		setMessage(null);
 		try {
 			const result = await syncPull();
+			const pushed = await syncPushPending();
 			await refresh();
-			setMessage(t("settings.sync.syncSuccess", { cursor: result.cursor || "0" }));
+			setMessage(t("settings.sync.syncSuccess", { cursor: pushed.cursor || result.cursor || "0" }));
 		} catch (err) {
 			setError(formatSyncError(err));
 		} finally {

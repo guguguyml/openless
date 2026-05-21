@@ -10,9 +10,11 @@ import {
   getHotkeyStatus,
   getSettings,
   getSyncAuthSession,
+  getSyncState,
   handleWindowHotkeyEvent,
   isTauri,
   syncPull,
+  syncPushPending,
 } from './lib/ipc';
 import {
   isWindowHotkeyKeyboardCandidate,
@@ -47,9 +49,61 @@ export function App({ isCapsule, isQa }: AppProps) {
       const session = await getSyncAuthSession();
       if (cancelled || !session?.accessToken) return;
       await syncPull();
+      if (!cancelled) await syncPushPending();
     })().catch(error => console.warn('[sync] startup pull failed', error));
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    let timer: number | null = null;
+    let running = false;
+
+    const runPendingPush = async () => {
+      if (cancelled || running) return;
+      running = true;
+      try {
+        const session = await getSyncAuthSession();
+        if (cancelled || !session?.accessToken) return;
+        const state = await getSyncState();
+        if (cancelled || state.pendingChanges.length === 0) return;
+        await syncPushPending();
+      } catch (error) {
+        console.warn('[sync] pending push failed', error);
+      } finally {
+        running = false;
+      }
+    };
+
+    const schedulePendingPush = (delayMs = 1200) => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        void runPendingPush();
+      }, delayMs);
+    };
+
+    const flushBeforeUnload = () => {
+      void runPendingPush();
+    };
+
+    schedulePendingPush(3000);
+    window.addEventListener('beforeunload', flushBeforeUnload);
+    void (async () => {
+      const { listen } = await import('@tauri-apps/api/event');
+      if (cancelled) return;
+      unlisten = await listen('sync:push-requested', () => schedulePendingPush());
+    })().catch(error => console.warn('[sync] listen push request failed', error));
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      window.removeEventListener('beforeunload', flushBeforeUnload);
+      if (unlisten) unlisten();
     };
   }, []);
 

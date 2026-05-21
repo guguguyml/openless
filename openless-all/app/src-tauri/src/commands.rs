@@ -1,10 +1,11 @@
 //! Tauri command surface — every IPC entry the React UI invokes lives here.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use crate::asr::local::foundry::{
@@ -32,10 +33,10 @@ use crate::sync_client::{
 use crate::types::{
     builtin_style_pack_id, default_active_style_pack_id, ChineseScriptPreference, ComboBinding,
     CorrectionRule, CredentialsStatus, DictationSession, DictionaryEntry, HotkeyCapability,
-    HotkeyStatus, OutputLanguagePreference, PolishMode, ShortcutBinding, StylePack, StylePackKind,
-    StylePackRuntimeDiagnostics, StyleSystemPrompts, SyncAuthSession, SyncChangeOperation,
-    SyncEntityKind, SyncSettings, SyncState, UpdateChannel, UserPreferences, VocabPresetStore,
-    WindowsImeStatus,
+    HotkeyStatus, OutputLanguagePreference, PendingSyncChange, PolishMode, ShortcutBinding,
+    StylePack, StylePackKind, StylePackRuntimeDiagnostics, StyleSystemPrompts, SyncAuthSession,
+    SyncChangeOperation, SyncEntityKind, SyncSettings, SyncState, UpdateChannel, UserPreferences,
+    VocabPresetStore, WindowsImeStatus,
 };
 
 type CoordinatorState<'a> = State<'a, Arc<Coordinator>>;
@@ -1449,6 +1450,10 @@ fn apply_pulled_style_packs(
     result: &SyncPullResult,
 ) -> Result<(), SyncApiError> {
     for value in &result.prompts {
+        if sync_deleted_at(value).is_some() {
+            apply_pulled_style_pack_delete(coord, value)?;
+            continue;
+        }
         let pack = serde_json::from_value::<StylePack>(value.clone()).map_err(|err| {
             SyncApiError::local(
                 "sync_style_pack_invalid",
@@ -1466,6 +1471,37 @@ fn apply_pulled_style_packs(
                     false,
                 )
             })?;
+    }
+    Ok(())
+}
+
+fn sync_deleted_at(value: &Value) -> Option<&str> {
+    value
+        .get("deleted_at")
+        .or_else(|| value.get("deletedAt"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn apply_pulled_style_pack_delete(coord: &Coordinator, value: &Value) -> Result<(), SyncApiError> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            SyncApiError::local("sync_style_pack_invalid", "同步删除缺少风格包 ID", false)
+        })?;
+    match coord.style_packs().get(id) {
+        Ok(pack) if pack.kind != StylePackKind::Builtin => {
+            coord.style_packs().remove_imported(id).map_err(|err| {
+                SyncApiError::local(
+                    "sync_style_pack_apply_failed",
+                    format!("同步风格包删除写入本地失败：{err}"),
+                    false,
+                )
+            })?;
+        }
+        Ok(_) | Err(_) => {}
     }
     Ok(())
 }
@@ -1493,6 +1529,176 @@ pub async fn sync_push(
         )
     })?;
     Ok(result)
+}
+
+#[tauri::command]
+pub async fn sync_push_pending(
+    coord: CoordinatorState<'_>,
+) -> Result<SyncPushResult, SyncApiError> {
+    let result = sync_push_pending_inner(&coord).await;
+    if let Err(error) = &result {
+        record_sync_push_error(&coord, error);
+    }
+    result
+}
+
+async fn sync_push_pending_inner(coord: &Coordinator) -> Result<SyncPushResult, SyncApiError> {
+    let settings = coord.sync_settings().get();
+    let session = require_sync_auth_session()?;
+    let state = coord.sync_state().get();
+    if state.pending_changes.is_empty() {
+        return Ok(SyncPushResult {
+            ok: true,
+            cursor: state.cursor.unwrap_or_default(),
+            conflicts_resolved: 0,
+        });
+    }
+
+    let (changes, pushed_change_ids) = build_pending_push_changes(coord, &state)?;
+    if pushed_change_ids.is_empty() {
+        return Ok(SyncPushResult {
+            ok: true,
+            cursor: state.cursor.unwrap_or_default(),
+            conflicts_resolved: 0,
+        });
+    }
+
+    let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
+    let result = client.push(state.device_id.clone(), changes).await?;
+    let next_state = successful_push_pending_state(
+        coord.sync_state().get(),
+        &result.cursor,
+        chrono::Utc::now().to_rfc3339(),
+        &pushed_change_ids,
+    );
+    coord.sync_state().set(next_state).map_err(|err| {
+        SyncApiError::local(
+            "sync_state_save_failed",
+            format!("同步状态保存失败：{err}"),
+            false,
+        )
+    })?;
+    Ok(result)
+}
+
+fn build_pending_push_changes(
+    coord: &Coordinator,
+    state: &SyncState,
+) -> Result<(SyncPushChanges, HashSet<String>), SyncApiError> {
+    let mut changes = SyncPushChanges::default();
+    let mut pushed_change_ids = HashSet::new();
+    for change in &state.pending_changes {
+        if change.entity != SyncEntityKind::StylePack {
+            continue;
+        }
+        let value = pending_style_pack_change_value(coord, state, change)?;
+        changes.prompts.push(value);
+        pushed_change_ids.insert(change.id.clone());
+    }
+    Ok((changes, pushed_change_ids))
+}
+
+fn pending_style_pack_change_value(
+    coord: &Coordinator,
+    state: &SyncState,
+    change: &PendingSyncChange,
+) -> Result<Value, SyncApiError> {
+    match change.operation {
+        SyncChangeOperation::Upsert => {
+            let pack = coord.style_packs().get(&change.entity_id).map_err(|err| {
+                SyncApiError::local(
+                    "sync_style_pack_missing",
+                    format!("待同步风格包不存在：{err}"),
+                    false,
+                )
+            })?;
+            let mut value = serde_json::to_value(pack).map_err(|err| {
+                SyncApiError::local(
+                    "sync_style_pack_encode_failed",
+                    format!("风格包同步数据编码失败：{err}"),
+                    false,
+                )
+            })?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("device_id".into(), Value::String(state.device_id.clone()));
+                object.insert(
+                    "sync_version".into(),
+                    Value::from(change.attempts as i64 + 1),
+                );
+            }
+            Ok(value)
+        }
+        SyncChangeOperation::Delete => Ok(deleted_style_pack_push_value(change, &state.device_id)),
+    }
+}
+
+fn deleted_style_pack_push_value(change: &PendingSyncChange, device_id: &str) -> Value {
+    let deleted_at = if change.queued_at.trim().is_empty() {
+        chrono::Utc::now().to_rfc3339()
+    } else {
+        change.queued_at.clone()
+    };
+    json!({
+        "id": change.entity_id,
+        "device_id": device_id,
+        "name": "Deleted style pack",
+        "description": "",
+        "author": null,
+        "version": "1.0.0",
+        "kind": "imported",
+        "baseMode": "light",
+        "prompt": "Deleted style pack.",
+        "examples": [],
+        "tags": [],
+        "iconPath": null,
+        "createdAt": deleted_at,
+        "updatedAt": deleted_at,
+        "enabled": false,
+        "active": false,
+        "recommendedModel": null,
+        "compatibleAppVersion": null,
+        "originPackId": null,
+        "originAuthorLogin": null,
+        "deleted_at": deleted_at,
+        "sync_version": change.attempts as i64 + 1,
+    })
+}
+
+fn successful_push_pending_state(
+    mut state: SyncState,
+    cursor: &str,
+    synced_at: String,
+    pushed_change_ids: &HashSet<String>,
+) -> SyncState {
+    state.cursor = if cursor.trim().is_empty() {
+        None
+    } else {
+        Some(cursor.to_string())
+    };
+    state.last_sync_at = Some(synced_at.clone());
+    state.last_push_at = Some(synced_at);
+    state.last_error = None;
+    state
+        .pending_changes
+        .retain(|change| !pushed_change_ids.contains(&change.id));
+    state
+}
+
+fn failed_push_pending_state(mut state: SyncState, error: &SyncApiError) -> SyncState {
+    let message = error.to_string();
+    state.last_error = Some(message.clone());
+    for change in &mut state.pending_changes {
+        change.attempts = change.attempts.saturating_add(1);
+        change.last_error = Some(message.clone());
+    }
+    state
+}
+
+fn record_sync_push_error(coord: &Coordinator, error: &SyncApiError) {
+    let state = failed_push_pending_state(coord.sync_state().get(), error);
+    if let Err(save_error) = coord.sync_state().set(state) {
+        log::warn!("[sync] save push error failed: {save_error}");
+    }
 }
 
 #[tauri::command]
@@ -3361,18 +3567,19 @@ pub async fn github_device_flow_poll(
 mod tests {
     use super::{
         active_asr_is_keyless_for_validation, active_foundry_model_from_prefs,
-        asr_configured_for_provider, asr_transcriptions_url, failed_pull_state,
-        fetch_provider_models, is_gemini_base_url, is_valid_local_pack_id, is_valid_session_id,
-        llm_configured_for_provider, local_asr_release_plan_for_provider, models_url,
-        normalize_foundry_language_hint, parse_gemini_model_ids, parse_latest_beta_from_atom,
-        parse_model_ids, persist_settings, release_foundry_runtime_if_inactive,
-        successful_pull_state, validate_foundry_model_alias, ProviderConfig, SettingsWriter,
+        asr_configured_for_provider, asr_transcriptions_url, deleted_style_pack_push_value,
+        failed_pull_state, failed_push_pending_state, fetch_provider_models, is_gemini_base_url,
+        is_valid_local_pack_id, is_valid_session_id, llm_configured_for_provider,
+        local_asr_release_plan_for_provider, models_url, normalize_foundry_language_hint,
+        parse_gemini_model_ids, parse_latest_beta_from_atom, parse_model_ids, persist_settings,
+        release_foundry_runtime_if_inactive, successful_pull_state, successful_push_pending_state,
+        sync_deleted_at, validate_foundry_model_alias, ProviderConfig, SettingsWriter,
     };
     use crate::persistence::CredentialsSnapshot;
     use crate::sync_client::SyncApiError;
     use crate::types::{
-        ComboBinding, HotkeyBinding, HotkeyMode, HotkeyTrigger, ShortcutBinding, SyncState,
-        UserPreferences,
+        ComboBinding, HotkeyBinding, HotkeyMode, HotkeyTrigger, PendingSyncChange, ShortcutBinding,
+        SyncChangeOperation, SyncEntityKind, SyncState, UserPreferences,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -4159,6 +4366,96 @@ mod tests {
             next.last_error.as_deref(),
             Some("sync_network_failed: network unavailable")
         );
+    }
+
+    #[test]
+    fn successful_push_pending_state_removes_only_pushed_changes() {
+        let mut pushed = std::collections::HashSet::new();
+        pushed.insert("change-a".to_string());
+        let state = SyncState {
+            cursor: Some("cursor-31".into()),
+            pending_changes: vec![
+                PendingSyncChange {
+                    id: "change-a".into(),
+                    entity_id: "pack-a".into(),
+                    ..Default::default()
+                },
+                PendingSyncChange {
+                    id: "change-b".into(),
+                    entity_id: "pack-b".into(),
+                    ..Default::default()
+                },
+            ],
+            last_error: Some("old error".into()),
+            ..Default::default()
+        };
+
+        let next = successful_push_pending_state(
+            state,
+            "cursor-32",
+            "2026-05-21T00:00:01Z".into(),
+            &pushed,
+        );
+
+        assert_eq!(next.cursor.as_deref(), Some("cursor-32"));
+        assert_eq!(next.last_sync_at.as_deref(), Some("2026-05-21T00:00:01Z"));
+        assert_eq!(next.last_push_at.as_deref(), Some("2026-05-21T00:00:01Z"));
+        assert_eq!(next.last_error, None);
+        assert_eq!(next.pending_changes.len(), 1);
+        assert_eq!(next.pending_changes[0].id, "change-b");
+    }
+
+    #[test]
+    fn failed_push_pending_state_keeps_queue_and_records_attempts() {
+        let state = SyncState {
+            pending_changes: vec![PendingSyncChange {
+                id: "change-a".into(),
+                entity_id: "pack-a".into(),
+                attempts: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let error = SyncApiError::local("sync_http_500", "server failed", true);
+
+        let next = failed_push_pending_state(state, &error);
+
+        assert_eq!(next.pending_changes.len(), 1);
+        assert_eq!(next.pending_changes[0].attempts, 3);
+        assert_eq!(
+            next.pending_changes[0].last_error.as_deref(),
+            Some("sync_http_500: server failed")
+        );
+        assert_eq!(
+            next.last_error.as_deref(),
+            Some("sync_http_500: server failed")
+        );
+    }
+
+    #[test]
+    fn deleted_style_pack_push_value_contains_required_tombstone_fields() {
+        let change = PendingSyncChange {
+            id: "change-delete".into(),
+            entity: SyncEntityKind::StylePack,
+            entity_id: "pack-delete".into(),
+            operation: SyncChangeOperation::Delete,
+            queued_at: "2026-05-21T00:00:02Z".into(),
+            attempts: 1,
+            last_error: None,
+        };
+
+        let value = deleted_style_pack_push_value(&change, "device-1");
+
+        assert_eq!(value["id"], "pack-delete");
+        assert_eq!(value["device_id"], "device-1");
+        assert_eq!(value["kind"], "imported");
+        assert_eq!(value["baseMode"], "light");
+        assert_eq!(value["updatedAt"], "2026-05-21T00:00:02Z");
+        assert_eq!(value["deleted_at"], "2026-05-21T00:00:02Z");
+        assert_eq!(sync_deleted_at(&value), Some("2026-05-21T00:00:02Z"));
+        assert!(value["prompt"]
+            .as_str()
+            .is_some_and(|prompt| !prompt.is_empty()));
     }
 
     #[test]
