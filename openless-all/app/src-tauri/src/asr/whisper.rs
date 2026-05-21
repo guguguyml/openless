@@ -615,9 +615,9 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let request = read_http_request(&mut stream);
-                let request_text = String::from_utf8_lossy(&request);
-                assert!(request_text.starts_with("POST /audio/transcriptions HTTP/1.1"));
-                assert!(request_text.contains("authorization: Bearer key"));
+                let request_text = String::from_utf8_lossy(&request).to_lowercase();
+                assert!(request_text.starts_with("post /audio/transcriptions http/1.1"));
+                assert!(request_text.contains("authorization: bearer key"));
                 assert!(request_text.contains("model"));
                 write_json_response(&mut stream, &format!(r#"{{"text":"{}"}}"#, text));
             }

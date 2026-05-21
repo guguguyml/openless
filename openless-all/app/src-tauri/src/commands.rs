@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -166,12 +166,16 @@ pub fn set_settings(
     tray_microphones: State<'_, TrayMicrophoneMenuState>,
     mut prefs: UserPreferences,
 ) -> Result<(), String> {
+    let previous_prefs = coord.prefs().get();
     let packs = coord.style_packs().list().map_err(|e| e.to_string())?;
     sync_style_pack_preferences(&mut prefs, &packs);
     // 广播给所有 webview。issue #205：QaPanel 跑在独立 webview，
     // 没有 HotkeySettingsContext，必须靠事件感知录音键变化，否则面板可见时
     // 用户改键会让浮窗里的 "{recordHotkey}" 文案一直停留在旧值。
     persist_settings(&*coord, prefs.clone())?;
+    if syncable_preferences_changed(&previous_prefs, &prefs) {
+        queue_preferences_sync_change(&*coord, &app)?;
+    }
     // refresh_tray_microphone_menu 内部会调用 NSStatusItem.set_menu，必须在主线程上跑。
     // set_settings 本身是同步 Tauri command，在 IPC handler 线程上执行；从这里直接调
     // 会触发 macOS 主线程断言或在 dispatch 队列上死锁，导致整个 UI 无响应（用户改
@@ -214,12 +218,16 @@ pub(crate) fn sync_style_pack_prefs_and_persist(
     app: &AppHandle,
     mut prefs: UserPreferences,
 ) -> Result<UserPreferences, String> {
+    let previous_prefs = coord.prefs().get();
     let packs = coord.style_packs().list().map_err(|e| e.to_string())?;
     sync_style_pack_preferences(&mut prefs, &packs);
     coord
         .prefs()
         .set(prefs.clone())
         .map_err(|e| e.to_string())?;
+    if syncable_preferences_changed(&previous_prefs, &prefs) {
+        queue_preferences_sync_change(coord, app)?;
+    }
     emit_prefs_changed(app, &prefs);
     refresh_tray_menu_async(app);
     Ok(prefs)
@@ -664,19 +672,30 @@ async fn release_foundry_runtime_if_inactive(
 }
 
 #[tauri::command]
-pub fn set_credential(window: Window, account: String, value: String) -> Result<(), String> {
+pub fn set_credential(
+    coord: CoordinatorState<'_>,
+    app: AppHandle,
+    window: Window,
+    account: String,
+    value: String,
+) -> Result<(), String> {
     ensure_main_window(&window)?;
     let acc = parse_account(&account)?;
     if value.is_empty() {
-        CredentialsVault::remove(acc).map_err(|e| e.to_string())
+        CredentialsVault::remove(acc).map_err(|e| e.to_string())?;
     } else {
-        CredentialsVault::set(acc, &value).map_err(|e| e.to_string())
+        CredentialsVault::set(acc, &value).map_err(|e| e.to_string())?;
     }
+    if syncable_credential_account(acc) {
+        queue_preferences_sync_change(&*coord, &app)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn set_active_asr_provider(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     runtime: State<'_, Arc<FoundryLocalRuntime>>,
     provider: String,
 ) -> Result<(), String> {
@@ -696,12 +715,19 @@ pub async fn set_active_asr_provider(
         coord.release_local_asr_engine();
     }
     release_foundry_runtime_if_inactive(runtime.inner(), release_plan.foundry).await;
+    queue_preferences_sync_change(&*coord, &app)?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn set_active_llm_provider(provider: String) -> Result<(), String> {
-    CredentialsVault::set_active_llm_provider(&provider).map_err(|e| e.to_string())
+pub fn set_active_llm_provider(
+    coord: CoordinatorState<'_>,
+    app: AppHandle,
+    provider: String,
+) -> Result<(), String> {
+    CredentialsVault::set_active_llm_provider(&provider).map_err(|e| e.to_string())?;
+    queue_preferences_sync_change(&*coord, &app)?;
+    Ok(())
 }
 
 /// 读出某个账号的实际值（用于设置页预填表单）。
@@ -1372,6 +1398,131 @@ fn queue_vocab_sync_change(
     Ok(())
 }
 
+const PREFERENCES_SYNC_ENTITY_ID: &str = "preferences";
+const PREFERENCES_PROVIDER_CONFIG_TYPE: &str = "preferences";
+const PREFERENCES_PROVIDER_CONFIG_BASE_URL: &str = "preferences://v1";
+const PREFERENCES_PROVIDER_CONFIG_MODEL_NAME: &str = "preferences-v1";
+
+fn queue_preferences_sync_change(coord: &Coordinator, app: &AppHandle) -> Result<(), String> {
+    let change = crate::types::PendingSyncChange {
+        id: format!("change-{}", uuid::Uuid::new_v4().simple()),
+        entity: SyncEntityKind::Preferences,
+        entity_id: PREFERENCES_SYNC_ENTITY_ID.to_string(),
+        operation: SyncChangeOperation::Upsert,
+        queued_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+        last_error: None,
+    };
+    let state = coord
+        .sync_state()
+        .enqueue(change)
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = app.emit(
+        "sync:push-requested",
+        serde_json::json!({
+            "entity": SyncEntityKind::Preferences,
+            "entityId": PREFERENCES_SYNC_ENTITY_ID,
+            "operation": SyncChangeOperation::Upsert,
+            "pendingCount": state.pending_changes.len(),
+        }),
+    ) {
+        log::warn!("[sync] emit push request failed: {error}");
+    }
+    Ok(())
+}
+
+fn syncable_credential_account(account: CredentialAccount) -> bool {
+    matches!(
+        account,
+        CredentialAccount::ArkModelId
+            | CredentialAccount::ArkEndpoint
+            | CredentialAccount::AsrEndpoint
+            | CredentialAccount::AsrModel
+    )
+}
+
+fn syncable_preferences_changed(before: &UserPreferences, after: &UserPreferences) -> bool {
+    syncable_preferences_value(before) != syncable_preferences_value(after)
+}
+
+fn syncable_preferences_value(prefs: &UserPreferences) -> Value {
+    json!({
+        "activeAsrProvider": prefs.active_asr_provider,
+        "activeLlmProvider": prefs.active_llm_provider,
+        "activeStylePackId": prefs.active_style_pack_id,
+        "workingLanguages": prefs.working_languages,
+        "translationTargetLanguage": prefs.translation_target_language,
+        "chineseScriptPreference": prefs.chinese_script_preference,
+        "outputLanguagePreference": prefs.output_language_preference,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreferencesProviderConfigPayload {
+    active_asr_provider: String,
+    active_llm_provider: String,
+    asr_base_url: String,
+    asr_model_name: String,
+    llm_base_url: String,
+    llm_model_name: String,
+    active_style_pack_id: String,
+    working_languages: Vec<String>,
+    translation_target_language: String,
+    chinese_script_preference: ChineseScriptPreference,
+    output_language_preference: OutputLanguagePreference,
+}
+
+fn preferences_provider_config_payload(
+    prefs: &UserPreferences,
+    credentials: &CredentialsSnapshot,
+    active_asr_provider: &str,
+    active_llm_provider: &str,
+) -> String {
+    let payload = PreferencesProviderConfigPayload {
+        active_asr_provider: active_asr_provider.to_string(),
+        active_llm_provider: active_llm_provider.to_string(),
+        asr_base_url: credentials.asr_endpoint.clone().unwrap_or_default(),
+        asr_model_name: credentials.asr_model.clone().unwrap_or_default(),
+        llm_base_url: credentials.ark_endpoint.clone().unwrap_or_default(),
+        llm_model_name: credentials.ark_model_id.clone().unwrap_or_default(),
+        active_style_pack_id: prefs.active_style_pack_id.clone(),
+        working_languages: prefs.working_languages.clone(),
+        translation_target_language: prefs.translation_target_language.clone(),
+        chinese_script_preference: prefs.chinese_script_preference,
+        output_language_preference: prefs.output_language_preference,
+    };
+    serde_json::to_string(&payload).expect("preferences provider config payload should encode")
+}
+
+fn preferences_provider_config_push_values(
+    prefs: &UserPreferences,
+    credentials: &CredentialsSnapshot,
+    active_asr_provider: &str,
+    active_llm_provider: &str,
+    device_id: &str,
+    updated_at: &str,
+    version: i64,
+) -> Vec<Value> {
+    vec![json!({
+        "id": PREFERENCES_SYNC_ENTITY_ID,
+        "device_id": device_id,
+        "provider_type": PREFERENCES_PROVIDER_CONFIG_TYPE,
+        "base_url": PREFERENCES_PROVIDER_CONFIG_BASE_URL,
+        "model_name": PREFERENCES_PROVIDER_CONFIG_MODEL_NAME,
+        "language": preferences_provider_config_payload(
+            prefs,
+            credentials,
+            active_asr_provider,
+            active_llm_provider
+        ),
+        "default_prompt_id": prefs.active_style_pack_id,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+        "version": version,
+    })]
+}
+
 #[tauri::command]
 pub fn get_sync_auth_session() -> Result<Option<SyncAuthSession>, String> {
     SyncAuthVault::get().map_err(|e| e.to_string())
@@ -1473,6 +1624,8 @@ async fn sync_pull_inner(coord: &Coordinator) -> Result<SyncPullResult, SyncApiE
     let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
     let result = client.pull(cursor.as_deref()).await?;
     apply_pulled_style_packs(coord, &result)?;
+    sync_style_pack_preferences_after_pull(coord)?;
+    apply_pulled_provider_configs(coord, &result)?;
     apply_pulled_history_items(coord, &result)?;
     apply_pulled_vocab_items(coord, &result)?;
     let next_state = successful_pull_state(
@@ -1544,6 +1697,27 @@ fn apply_pulled_style_packs(
     Ok(())
 }
 
+fn sync_style_pack_preferences_after_pull(coord: &Coordinator) -> Result<(), SyncApiError> {
+    let mut prefs = coord.prefs().get();
+    let packs = coord.style_packs().list().map_err(|err| {
+        SyncApiError::local(
+            "sync_style_pack_apply_failed",
+            format!("同步风格包读取本地失败：{err}"),
+            false,
+        )
+    })?;
+    if sync_style_pack_preferences(&mut prefs, &packs) {
+        coord.prefs().set(prefs).map_err(|err| {
+            SyncApiError::local(
+                "sync_preferences_save_failed",
+                format!("同步偏好写入本地失败：{err}"),
+                false,
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn sync_deleted_at(value: &Value) -> Option<&str> {
     value
         .get("deleted_at")
@@ -1572,6 +1746,170 @@ fn apply_pulled_style_pack_delete(coord: &Coordinator, value: &Value) -> Result<
         }
         Ok(_) | Err(_) => {}
     }
+    Ok(())
+}
+
+fn apply_pulled_provider_configs(
+    coord: &Coordinator,
+    result: &SyncPullResult,
+) -> Result<(), SyncApiError> {
+    let mut prefs = coord.prefs().get();
+    let mut applied = false;
+    for value in &result.provider_configs {
+        if sync_deleted_at(value).is_some() {
+            continue;
+        }
+        let Some(id) = sync_string(value, &["id"]) else {
+            continue;
+        };
+        if id != PREFERENCES_SYNC_ENTITY_ID {
+            continue;
+        }
+
+        let provider_type = required_sync_string(
+            value,
+            &["provider_type", "providerType"],
+            "sync_preferences_invalid",
+            "同步偏好配置缺少 provider_type",
+        )?;
+        if provider_type != PREFERENCES_PROVIDER_CONFIG_TYPE {
+            return Err(SyncApiError::local(
+                "sync_preferences_invalid",
+                format!("同步偏好配置 provider_type 不匹配：{provider_type}"),
+                false,
+            ));
+        }
+
+        let base_url = required_sync_string(
+            value,
+            &["base_url", "baseUrl"],
+            "sync_preferences_invalid",
+            "同步偏好配置缺少 base_url",
+        )?;
+        if base_url != PREFERENCES_PROVIDER_CONFIG_BASE_URL {
+            return Err(SyncApiError::local(
+                "sync_preferences_invalid",
+                format!("同步偏好配置 base_url 不匹配：{base_url}"),
+                false,
+            ));
+        }
+
+        let model_name = required_sync_string(
+            value,
+            &["model_name", "modelName"],
+            "sync_preferences_invalid",
+            "同步偏好配置缺少 model_name",
+        )?;
+        if model_name != PREFERENCES_PROVIDER_CONFIG_MODEL_NAME {
+            return Err(SyncApiError::local(
+                "sync_preferences_invalid",
+                format!("同步偏好配置 model_name 不匹配：{model_name}"),
+                false,
+            ));
+        }
+
+        let payload = preferences_provider_config_payload_from_value(value)?;
+        apply_preferences_provider_config_payload(&mut prefs, &payload);
+        apply_preferences_provider_config_credentials(&payload)?;
+        applied = true;
+    }
+
+    if applied {
+        let packs = coord.style_packs().list().map_err(|err| {
+            SyncApiError::local(
+                "sync_preferences_apply_failed",
+                format!("同步偏好读取风格包失败：{err}"),
+                false,
+            )
+        })?;
+        sync_style_pack_preferences(&mut prefs, &packs);
+        coord.prefs().set(prefs).map_err(|err| {
+            SyncApiError::local(
+                "sync_preferences_save_failed",
+                format!("同步偏好写入本地失败：{err}"),
+                false,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn preferences_provider_config_payload_from_value(
+    value: &Value,
+) -> Result<PreferencesProviderConfigPayload, SyncApiError> {
+    let payload = required_sync_string(
+        value,
+        &["language"],
+        "sync_preferences_invalid",
+        "同步偏好配置缺少 language",
+    )?;
+    serde_json::from_str(&payload).map_err(|err| {
+        SyncApiError::local(
+            "sync_preferences_invalid",
+            format!("同步偏好配置载荷无法识别：{err}"),
+            false,
+        )
+    })
+}
+
+fn apply_preferences_provider_config_payload(
+    prefs: &mut UserPreferences,
+    payload: &PreferencesProviderConfigPayload,
+) {
+    prefs.active_asr_provider = payload.active_asr_provider.clone();
+    prefs.active_llm_provider = payload.active_llm_provider.clone();
+    prefs.active_style_pack_id = payload.active_style_pack_id.clone();
+    prefs.working_languages = payload.working_languages.clone();
+    prefs.translation_target_language = payload.translation_target_language.clone();
+    prefs.chinese_script_preference = payload.chinese_script_preference;
+    prefs.output_language_preference = payload.output_language_preference;
+}
+
+fn apply_preferences_provider_config_credentials(
+    payload: &PreferencesProviderConfigPayload,
+) -> Result<(), SyncApiError> {
+    CredentialsVault::set(CredentialAccount::AsrEndpoint, &payload.asr_base_url).map_err(|err| {
+        SyncApiError::local(
+            "sync_preferences_save_failed",
+            format!("同步偏好写入 ASR endpoint 失败：{err}"),
+            false,
+        )
+    })?;
+    CredentialsVault::set(CredentialAccount::AsrModel, &payload.asr_model_name).map_err(|err| {
+        SyncApiError::local(
+            "sync_preferences_save_failed",
+            format!("同步偏好写入 ASR model 失败：{err}"),
+            false,
+        )
+    })?;
+    CredentialsVault::set(CredentialAccount::ArkEndpoint, &payload.llm_base_url).map_err(|err| {
+        SyncApiError::local(
+            "sync_preferences_save_failed",
+            format!("同步偏好写入 LLM endpoint 失败：{err}"),
+            false,
+        )
+    })?;
+    CredentialsVault::set(CredentialAccount::ArkModelId, &payload.llm_model_name).map_err(|err| {
+        SyncApiError::local(
+            "sync_preferences_save_failed",
+            format!("同步偏好写入 LLM model 失败：{err}"),
+            false,
+        )
+    })?;
+    CredentialsVault::set_active_asr_provider(&payload.active_asr_provider).map_err(|err| {
+        SyncApiError::local(
+            "sync_preferences_save_failed",
+            format!("同步偏好写入 ASR provider 失败：{err}"),
+            false,
+        )
+    })?;
+    CredentialsVault::set_active_llm_provider(&payload.active_llm_provider).map_err(|err| {
+        SyncApiError::local(
+            "sync_preferences_save_failed",
+            format!("同步偏好写入 LLM provider 失败：{err}"),
+            false,
+        )
+    })?;
     Ok(())
 }
 
@@ -2003,10 +2341,42 @@ fn build_pending_push_changes(
                 changes.vocab_presets.push(value);
                 pushed_change_ids.insert(change.id.clone());
             }
+            SyncEntityKind::Preferences | SyncEntityKind::ProviderConfig => {
+                let values = pending_preferences_provider_config_values(coord, state, change)?;
+                changes.provider_configs.extend(values);
+                pushed_change_ids.insert(change.id.clone());
+            }
             _ => {}
         }
     }
     Ok((changes, pushed_change_ids))
+}
+
+fn pending_preferences_provider_config_values(
+    coord: &Coordinator,
+    state: &SyncState,
+    change: &PendingSyncChange,
+) -> Result<Vec<Value>, SyncApiError> {
+    if change.operation == SyncChangeOperation::Delete {
+        return Err(SyncApiError::local(
+            "sync_preferences_delete_unsupported",
+            "偏好配置同步不支持删除操作",
+            false,
+        ));
+    }
+    let prefs = coord.prefs().get();
+    let credentials = CredentialsVault::snapshot();
+    let active_asr_provider = CredentialsVault::get_active_asr();
+    let active_llm_provider = CredentialsVault::get_active_llm();
+    Ok(preferences_provider_config_push_values(
+        &prefs,
+        &credentials,
+        &active_asr_provider,
+        &active_llm_provider,
+        &state.device_id,
+        &change.queued_at,
+        change.attempts as i64 + 1,
+    ))
 }
 
 fn pending_style_pack_change_value(
@@ -4562,16 +4932,21 @@ mod tests {
         is_valid_session_id, llm_configured_for_provider, local_asr_release_plan_for_provider,
         models_url, normalize_foundry_language_hint, parse_gemini_model_ids,
         parse_latest_beta_from_atom, parse_model_ids, persist_settings,
+        preferences_provider_config_payload_from_value, preferences_provider_config_push_values,
         pulled_history_value_to_session, successful_pull_state, successful_push_pending_state,
         sync_deleted_at, validate_foundry_model_alias, vocab_preset_local_id,
-        vocab_preset_push_value, vocab_preset_sync_id, ProviderConfig, SettingsWriter,
+        vocab_preset_push_value, vocab_preset_sync_id, PreferencesProviderConfigPayload,
+        ProviderConfig, SettingsWriter, PREFERENCES_PROVIDER_CONFIG_BASE_URL,
+        PREFERENCES_PROVIDER_CONFIG_MODEL_NAME, PREFERENCES_PROVIDER_CONFIG_TYPE,
+        PREFERENCES_SYNC_ENTITY_ID, apply_preferences_provider_config_payload,
     };
     use crate::persistence::CredentialsSnapshot;
     use crate::sync_client::SyncApiError;
     use crate::types::{
-        ComboBinding, CorrectionRule, DictationSession, DictionaryEntry, HotkeyBinding, HotkeyMode,
-        HotkeyTrigger, InsertStatus, PendingSyncChange, PolishMode, ShortcutBinding,
-        SyncChangeOperation, SyncEntityKind, SyncState, UserPreferences, VocabPreset,
+        ChineseScriptPreference, ComboBinding, CorrectionRule, DictationSession, DictionaryEntry,
+        HotkeyBinding, HotkeyMode, HotkeyTrigger, InsertStatus, OutputLanguagePreference,
+        PendingSyncChange, PolishMode, ShortcutBinding, SyncChangeOperation, SyncEntityKind,
+        SyncState, UserPreferences, VocabPreset,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -4800,6 +5175,102 @@ mod tests {
             "custom",
             &endpoint_without_model
         ));
+    }
+
+    #[test]
+    fn preferences_provider_config_push_values_only_carries_whitelisted_fields() {
+        let prefs = UserPreferences {
+            active_asr_provider: "whisper".into(),
+            active_llm_provider: "ark".into(),
+            active_style_pack_id: "custom.meeting".into(),
+            working_languages: vec!["中文".into(), "English".into()],
+            translation_target_language: "日语".into(),
+            chinese_script_preference: ChineseScriptPreference::Traditional,
+            output_language_preference: OutputLanguagePreference::ZhTw,
+            ..Default::default()
+        };
+        let credentials = CredentialsSnapshot {
+            asr_endpoint: Some("https://asr.example.com/v1".into()),
+            asr_model: Some("whisper-1".into()),
+            ark_endpoint: Some("https://llm.example.com/v1".into()),
+            ark_model_id: Some("glm-4.5".into()),
+            asr_api_key: Some("secret-asr".into()),
+            ark_api_key: Some("secret-llm".into()),
+            ..snapshot()
+        };
+
+        let values = preferences_provider_config_push_values(
+            &prefs,
+            &credentials,
+            "whisper",
+            "ark",
+            "device-1",
+            "2026-05-21T00:00:00Z",
+            2,
+        );
+
+        assert_eq!(values.len(), 1);
+        let value = &values[0];
+        assert_eq!(value["id"], PREFERENCES_SYNC_ENTITY_ID);
+        assert_eq!(value["provider_type"], PREFERENCES_PROVIDER_CONFIG_TYPE);
+        assert_eq!(value["base_url"], PREFERENCES_PROVIDER_CONFIG_BASE_URL);
+        assert_eq!(value["model_name"], PREFERENCES_PROVIDER_CONFIG_MODEL_NAME);
+        assert_eq!(value["device_id"], "device-1");
+        assert_eq!(value["created_at"], "2026-05-21T00:00:00Z");
+        assert_eq!(value["updated_at"], "2026-05-21T00:00:00Z");
+
+        let payload: PreferencesProviderConfigPayload =
+            serde_json::from_str(value["language"].as_str().expect("language payload")).unwrap();
+        assert_eq!(payload.active_asr_provider, "whisper");
+        assert_eq!(payload.active_llm_provider, "ark");
+        assert_eq!(payload.asr_base_url, "https://asr.example.com/v1");
+        assert_eq!(payload.asr_model_name, "whisper-1");
+        assert_eq!(payload.llm_base_url, "https://llm.example.com/v1");
+        assert_eq!(payload.llm_model_name, "glm-4.5");
+        assert_eq!(payload.active_style_pack_id, "custom.meeting");
+        assert_eq!(payload.working_languages, vec!["中文", "English"]);
+        assert_eq!(payload.translation_target_language, "日语");
+        assert_eq!(payload.chinese_script_preference, ChineseScriptPreference::Traditional);
+        assert_eq!(payload.output_language_preference, OutputLanguagePreference::ZhTw);
+        assert!(!value.to_string().contains("secret-asr"));
+        assert!(!value.to_string().contains("secret-llm"));
+    }
+
+    #[test]
+    fn preferences_provider_config_payload_updates_only_syncable_fields() {
+        let raw = serde_json::json!({
+            "id": PREFERENCES_SYNC_ENTITY_ID,
+            "provider_type": PREFERENCES_PROVIDER_CONFIG_TYPE,
+            "base_url": PREFERENCES_PROVIDER_CONFIG_BASE_URL,
+            "model_name": PREFERENCES_PROVIDER_CONFIG_MODEL_NAME,
+            "language": serde_json::to_string(&PreferencesProviderConfigPayload {
+                active_asr_provider: "whisper".into(),
+                active_llm_provider: "ark".into(),
+                asr_base_url: "https://asr.example.com/v1".into(),
+                asr_model_name: "whisper-1".into(),
+                llm_base_url: "https://llm.example.com/v1".into(),
+                llm_model_name: "glm-4.5".into(),
+                active_style_pack_id: "custom.meeting".into(),
+                working_languages: vec!["中文".into(), "English".into()],
+                translation_target_language: "日语".into(),
+                chinese_script_preference: ChineseScriptPreference::Traditional,
+                output_language_preference: OutputLanguagePreference::ZhTw,
+            })
+            .unwrap()
+        });
+
+        let payload = preferences_provider_config_payload_from_value(&raw).unwrap();
+        let mut prefs = UserPreferences::default();
+        apply_preferences_provider_config_payload(&mut prefs, &payload);
+
+        assert_eq!(prefs.active_asr_provider, "whisper");
+        assert_eq!(prefs.active_llm_provider, "ark");
+        assert_eq!(prefs.active_style_pack_id, "custom.meeting");
+        assert_eq!(prefs.working_languages, vec!["中文", "English"]);
+        assert_eq!(prefs.translation_target_language, "日语");
+        assert_eq!(prefs.chinese_script_preference, ChineseScriptPreference::Traditional);
+        assert_eq!(prefs.output_language_preference, OutputLanguagePreference::ZhTw);
+        assert!(!prefs.launch_at_login);
     }
 
     impl SettingsWriter for FakeSettingsWriter {
