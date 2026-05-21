@@ -925,6 +925,23 @@ impl HistoryStore {
         self.append_with_retention(session, 0, None)
     }
 
+    pub fn apply_synced_history(&self, session: DictationSession) -> Result<()> {
+        let _guard = self.lock.lock();
+        let mut sessions = self.read_locked()?;
+        if let Some(existing) = sessions.iter_mut().find(|item| item.id == session.id) {
+            if history_updated_at(&session) >= history_updated_at(existing) {
+                *existing = session;
+            }
+        } else {
+            sessions.insert(0, session);
+        }
+        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        if sessions.len() > HISTORY_CAP {
+            sessions.truncate(HISTORY_CAP);
+        }
+        self.write_locked(&sessions)
+    }
+
     /// `retention_days == 0` 跟旧 append 行为一致（不按时间清理）。
     /// `> 0` 时在写入新条目后顺手把超过 N 天的会话裁掉，写入时就完成清理，
     /// 不需要后台轮询。最后再受条数上限约束：
@@ -1003,6 +1020,14 @@ impl HistoryStore {
         let json = serde_json::to_vec_pretty(sessions).context("encode history failed")?;
         atomic_write(&self.path, &json)
     }
+}
+
+fn history_updated_at(session: &DictationSession) -> &str {
+    session
+        .updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&session.created_at)
 }
 
 // ───────────────────────── PreferencesStore ─────────────────────────

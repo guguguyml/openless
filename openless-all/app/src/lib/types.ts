@@ -18,6 +18,13 @@ export interface DictationSession {
   errorCode: string | null;
   durationMs: number | null;
   dictionaryEntryCount: number | null;
+  stylePackId: string | null;
+  stylePackName: string | null;
+  stylePackPromptSnapshot: string | null;
+  deviceId: string | null;
+  updatedAt: string | null;
+  deletedAt: string | null;
+  syncVersion: number | null;
   /** 该会话是否在录音时归档了原始 wav（取决于当时 prefs.recordAudioForDebug）。
    *  true 时前端在 History 渲染播放按钮，凭 id 通过 read_audio_recording IPC 拿字节流。 */
   hasAudioRecording: boolean | null;

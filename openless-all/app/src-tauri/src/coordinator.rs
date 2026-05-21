@@ -49,7 +49,8 @@ use crate::selection::capture_selection;
 use crate::types::PasteShortcut;
 use crate::types::{
     CapsulePayload, CapsuleState, ChineseScriptPreference, DictationSession, HotkeyCapability,
-    HotkeyStatus, HotkeyStatusState, InsertStatus, OutputLanguagePreference, PolishMode,
+    HotkeyStatus, HotkeyStatusState, InsertStatus, OutputLanguagePreference, PendingSyncChange,
+    PolishMode, SyncChangeOperation, SyncEntityKind,
 };
 #[cfg(target_os = "windows")]
 use crate::windows_ime_ipc::ImeSubmitTarget;
@@ -227,6 +228,41 @@ struct Inner {
     /// supervisor 线程，但 integration test 和未来 RunEvent::Exit 钩子需要这条
     /// 显式退出路径。审计 3.1.2。
     shutdown: AtomicBool,
+}
+
+fn queue_qa_history_sync_change(inner: &Arc<Inner>, session: &DictationSession) {
+    if session.raw_transcript.trim().is_empty() || session.final_text.trim().is_empty() {
+        return;
+    }
+    let change = PendingSyncChange {
+        id: format!("change-{}", uuid::Uuid::new_v4().simple()),
+        entity: SyncEntityKind::HistoryItem,
+        entity_id: session.id.clone(),
+        operation: SyncChangeOperation::Upsert,
+        queued_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+        last_error: None,
+    };
+    let state = match inner.sync_state.enqueue(change) {
+        Ok(state) => state,
+        Err(error) => {
+            log::warn!("[sync] queue history change failed: {error}");
+            return;
+        }
+    };
+    if let Some(app) = inner.app.lock().clone() {
+        if let Err(error) = app.emit(
+            "sync:push-requested",
+            serde_json::json!({
+                "entity": SyncEntityKind::HistoryItem,
+                "entityId": session.id,
+                "operation": SyncChangeOperation::Upsert,
+                "pendingCount": state.pending_changes.len(),
+            }),
+        ) {
+            log::warn!("[sync] emit push request failed: {error}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3145,9 +3181,10 @@ async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
     // mode=Raw、error_code=Some("qaSession") 的 placeholder，避免污染 schema 同时
     // 让用户能在历史里翻到这次问答的字面值。详见 issue #118。
     if prefs.qa_save_history {
+        let created_at = chrono::Utc::now().to_rfc3339();
         let session = DictationSession {
             id: Uuid::new_v4().to_string(),
-            created_at: Utc::now().to_rfc3339(),
+            created_at: created_at.clone(),
             raw_transcript: question.clone(),
             final_text: answer.clone(),
             mode: PolishMode::Raw,
@@ -3157,15 +3194,24 @@ async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
             error_code: Some("qaSession".to_string()),
             duration_ms: Some(raw.duration_ms),
             dictionary_entry_count: None,
+            style_pack_id: None,
+            style_pack_name: None,
+            style_pack_prompt_snapshot: None,
+            device_id: Some(inner.sync_state.get().device_id),
+            updated_at: Some(created_at),
+            deleted_at: None,
+            sync_version: Some(1),
             has_audio_recording: None,
         };
         let prefs_snapshot = inner.prefs.get();
         if let Err(e) = inner.history.append_with_retention(
-            session,
+            session.clone(),
             prefs_snapshot.history_retention_days,
             prefs_snapshot.history_max_entries,
         ) {
             log::error!("[coord] QA history append failed: {e}");
+        } else {
+            queue_qa_history_sync_change(inner, &session);
         }
     }
 

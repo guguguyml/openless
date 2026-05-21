@@ -439,6 +439,13 @@ const mockHistory: DictationSession[] = OL_DATA.history.map((h, i) => ({
   errorCode: null,
   durationMs: 600,
   dictionaryEntryCount: 28,
+  stylePackId: 'builtin.structured',
+  stylePackName: 'Structured',
+  stylePackPromptSnapshot: '',
+  deviceId: 'mock-device',
+  updatedAt: new Date().toISOString(),
+  deletedAt: null,
+  syncVersion: 1,
   hasAudioRecording: null,
 }));
 

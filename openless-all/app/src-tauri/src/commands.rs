@@ -33,10 +33,10 @@ use crate::sync_client::{
 use crate::types::{
     builtin_style_pack_id, default_active_style_pack_id, ChineseScriptPreference, ComboBinding,
     CorrectionRule, CredentialsStatus, DictationSession, DictionaryEntry, HotkeyCapability,
-    HotkeyStatus, OutputLanguagePreference, PendingSyncChange, PolishMode, ShortcutBinding,
-    StylePack, StylePackKind, StylePackRuntimeDiagnostics, StyleSystemPrompts, SyncAuthSession,
-    SyncChangeOperation, SyncEntityKind, SyncSettings, SyncState, UpdateChannel, UserPreferences,
-    VocabPresetStore, WindowsImeStatus,
+    HotkeyStatus, InsertStatus, OutputLanguagePreference, PendingSyncChange, PolishMode,
+    ShortcutBinding, StylePack, StylePackKind, StylePackRuntimeDiagnostics, StyleSystemPrompts,
+    SyncAuthSession, SyncChangeOperation, SyncEntityKind, SyncSettings, SyncState, UpdateChannel,
+    UserPreferences, VocabPresetStore, WindowsImeStatus,
 };
 
 type CoordinatorState<'a> = State<'a, Arc<Coordinator>>;
@@ -1305,6 +1305,39 @@ fn queue_style_pack_sync_change(
     Ok(())
 }
 
+fn queue_history_sync_change(
+    coord: &Coordinator,
+    app: &AppHandle,
+    history_id: &str,
+    operation: SyncChangeOperation,
+) -> Result<(), String> {
+    let change = crate::types::PendingSyncChange {
+        id: format!("change-{}", uuid::Uuid::new_v4().simple()),
+        entity: SyncEntityKind::HistoryItem,
+        entity_id: history_id.to_string(),
+        operation,
+        queued_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+        last_error: None,
+    };
+    let state = coord
+        .sync_state()
+        .enqueue(change)
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = app.emit(
+        "sync:push-requested",
+        serde_json::json!({
+            "entity": SyncEntityKind::HistoryItem,
+            "entityId": history_id,
+            "operation": operation,
+            "pendingCount": state.pending_changes.len(),
+        }),
+    ) {
+        log::warn!("[sync] emit push request failed: {error}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_sync_auth_session() -> Result<Option<SyncAuthSession>, String> {
     SyncAuthVault::get().map_err(|e| e.to_string())
@@ -1406,6 +1439,7 @@ async fn sync_pull_inner(coord: &Coordinator) -> Result<SyncPullResult, SyncApiE
     let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
     let result = client.pull(cursor.as_deref()).await?;
     apply_pulled_style_packs(coord, &result)?;
+    apply_pulled_history_items(coord, &result)?;
     let next_state = successful_pull_state(
         coord.sync_state().get(),
         &result.cursor,
@@ -1506,6 +1540,111 @@ fn apply_pulled_style_pack_delete(coord: &Coordinator, value: &Value) -> Result<
     Ok(())
 }
 
+fn apply_pulled_history_items(
+    coord: &Coordinator,
+    result: &SyncPullResult,
+) -> Result<(), SyncApiError> {
+    for value in &result.history_items {
+        if sync_deleted_at(value).is_some() {
+            apply_pulled_history_delete(coord, value)?;
+            continue;
+        }
+        let session = pulled_history_value_to_session(value)?;
+        coord
+            .history()
+            .apply_synced_history(session)
+            .map_err(|err| {
+                SyncApiError::local(
+                    "sync_history_apply_failed",
+                    format!("同步历史记录写入本地失败：{err}"),
+                    false,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn apply_pulled_history_delete(coord: &Coordinator, value: &Value) -> Result<(), SyncApiError> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| SyncApiError::local("sync_history_invalid", "同步删除缺少历史 ID", false))?;
+    coord.history().delete(id).map_err(|err| {
+        SyncApiError::local(
+            "sync_history_apply_failed",
+            format!("同步历史记录删除写入本地失败：{err}"),
+            false,
+        )
+    })
+}
+
+fn pulled_history_value_to_session(value: &Value) -> Result<DictationSession, SyncApiError> {
+    let id = required_sync_string(value, &["id"], "sync_history_invalid", "同步历史缺少 ID")?;
+    let created_at = required_sync_string(
+        value,
+        &["created_at", "createdAt"],
+        "sync_history_invalid",
+        "同步历史缺少创建时间",
+    )?;
+    let updated_at = sync_string(value, &["updated_at", "updatedAt"]).unwrap_or(created_at.clone());
+    let source_app = sync_string(value, &["source_app", "sourceApp"]);
+    Ok(DictationSession {
+        id,
+        created_at,
+        raw_transcript: required_sync_string(
+            value,
+            &["transcript_text", "transcriptText"],
+            "sync_history_invalid",
+            "同步历史缺少原文",
+        )?,
+        final_text: required_sync_string(
+            value,
+            &["polished_text", "polishedText"],
+            "sync_history_invalid",
+            "同步历史缺少结果文本",
+        )?,
+        mode: PolishMode::Light,
+        app_bundle_id: None,
+        app_name: source_app.filter(|item| !item.trim().is_empty()),
+        insert_status: InsertStatus::Inserted,
+        error_code: None,
+        duration_ms: None,
+        dictionary_entry_count: None,
+        style_pack_id: sync_string(value, &["prompt_id", "promptId"]),
+        style_pack_name: sync_string(value, &["prompt_name", "promptName"]),
+        style_pack_prompt_snapshot: sync_string(value, &["prompt_snapshot", "promptSnapshot"]),
+        device_id: sync_string(value, &["device_id", "deviceId"]),
+        updated_at: Some(updated_at),
+        deleted_at: sync_deleted_at(value).map(str::to_string),
+        sync_version: sync_i64(value, &["version", "sync_version", "syncVersion"]),
+        has_audio_recording: None,
+    })
+}
+
+fn required_sync_string(
+    value: &Value,
+    names: &[&str],
+    code: &'static str,
+    message: &'static str,
+) -> Result<String, SyncApiError> {
+    sync_string(value, names)
+        .filter(|item| !item.trim().is_empty())
+        .ok_or_else(|| SyncApiError::local(code, message, false))
+}
+
+fn sync_string(value: &Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str).map(str::to_string))
+}
+
+fn sync_i64(value: &Value, names: &[&str]) -> Option<i64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_i64))
+}
+
 #[tauri::command]
 pub async fn sync_push(
     coord: CoordinatorState<'_>,
@@ -1588,12 +1727,19 @@ fn build_pending_push_changes(
     let mut changes = SyncPushChanges::default();
     let mut pushed_change_ids = HashSet::new();
     for change in &state.pending_changes {
-        if change.entity != SyncEntityKind::StylePack {
-            continue;
+        match change.entity {
+            SyncEntityKind::StylePack => {
+                let value = pending_style_pack_change_value(coord, state, change)?;
+                changes.prompts.push(value);
+                pushed_change_ids.insert(change.id.clone());
+            }
+            SyncEntityKind::HistoryItem => {
+                let value = pending_history_change_value(coord, state, change)?;
+                changes.history_items.push(value);
+                pushed_change_ids.insert(change.id.clone());
+            }
+            _ => {}
         }
-        let value = pending_style_pack_change_value(coord, state, change)?;
-        changes.prompts.push(value);
-        pushed_change_ids.insert(change.id.clone());
     }
     Ok((changes, pushed_change_ids))
 }
@@ -1661,6 +1807,88 @@ fn deleted_style_pack_push_value(change: &PendingSyncChange, device_id: &str) ->
         "originAuthorLogin": null,
         "deleted_at": deleted_at,
         "sync_version": change.attempts as i64 + 1,
+    })
+}
+
+fn pending_history_change_value(
+    coord: &Coordinator,
+    state: &SyncState,
+    change: &PendingSyncChange,
+) -> Result<Value, SyncApiError> {
+    match change.operation {
+        SyncChangeOperation::Upsert => {
+            let session = coord
+                .history()
+                .list()
+                .map_err(|err| {
+                    SyncApiError::local(
+                        "sync_history_load_failed",
+                        format!("待同步历史记录读取失败：{err}"),
+                        false,
+                    )
+                })?
+                .into_iter()
+                .find(|item| item.id == change.entity_id)
+                .ok_or_else(|| {
+                    SyncApiError::local("sync_history_missing", "待同步历史记录不存在", false)
+                })?;
+            history_session_push_value(&session, &state.device_id, change.attempts as i64 + 1)
+        }
+        SyncChangeOperation::Delete => Ok(deleted_history_push_value(change, &state.device_id)),
+    }
+}
+
+fn history_session_push_value(
+    session: &DictationSession,
+    device_id: &str,
+    version: i64,
+) -> Result<Value, SyncApiError> {
+    if session.raw_transcript.trim().is_empty() || session.final_text.trim().is_empty() {
+        return Err(SyncApiError::local(
+            "sync_history_invalid",
+            "历史记录缺少可同步文本",
+            false,
+        ));
+    }
+    Ok(json!({
+        "id": session.id,
+        "device_id": session.device_id.as_deref().unwrap_or(device_id),
+        "transcript_text": session.raw_transcript,
+        "polished_text": session.final_text,
+        "prompt_id": session.style_pack_id.as_deref().unwrap_or(""),
+        "prompt_name": session.style_pack_name.as_deref().unwrap_or(""),
+        "prompt_snapshot": session.style_pack_prompt_snapshot.as_deref().unwrap_or(""),
+        "source_app": session.app_name.as_deref().or(session.app_bundle_id.as_deref()).unwrap_or(""),
+        "created_at": session.created_at,
+        "updated_at": session
+            .updated_at
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&session.created_at),
+        "deleted_at": session.deleted_at.as_deref().unwrap_or(""),
+        "version": session.sync_version.unwrap_or(version),
+    }))
+}
+
+fn deleted_history_push_value(change: &PendingSyncChange, device_id: &str) -> Value {
+    let deleted_at = if change.queued_at.trim().is_empty() {
+        chrono::Utc::now().to_rfc3339()
+    } else {
+        change.queued_at.clone()
+    };
+    json!({
+        "id": change.entity_id,
+        "device_id": device_id,
+        "transcript_text": "Deleted history item",
+        "polished_text": "Deleted history item",
+        "prompt_id": "",
+        "prompt_name": "",
+        "prompt_snapshot": "",
+        "source_app": "",
+        "created_at": deleted_at,
+        "updated_at": deleted_at,
+        "deleted_at": deleted_at,
+        "version": change.attempts as i64 + 1,
     })
 }
 
@@ -1770,13 +1998,38 @@ pub fn list_history(coord: CoordinatorState<'_>) -> Result<Vec<DictationSession>
 }
 
 #[tauri::command]
-pub fn delete_history_entry(coord: CoordinatorState<'_>, id: String) -> Result<(), String> {
-    coord.history().delete(&id).map_err(|e| e.to_string())
+pub fn delete_history_entry(
+    coord: CoordinatorState<'_>,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    let exists = coord
+        .history()
+        .list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|item| item.id == id);
+    coord.history().delete(&id).map_err(|e| e.to_string())?;
+    if exists {
+        queue_history_sync_change(&coord, &app, &id, SyncChangeOperation::Delete)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn clear_history(coord: CoordinatorState<'_>) -> Result<(), String> {
-    coord.history().clear().map_err(|e| e.to_string())
+pub fn clear_history(coord: CoordinatorState<'_>, app: AppHandle) -> Result<(), String> {
+    let ids: Vec<String> = coord
+        .history()
+        .list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    coord.history().clear().map_err(|e| e.to_string())?;
+    for id in ids {
+        queue_history_sync_change(&coord, &app, &id, SyncChangeOperation::Delete)?;
+    }
+    Ok(())
 }
 
 /// 读取某次会话的原始麦克风 wav 字节流。仅当用户开过
@@ -3567,19 +3820,21 @@ pub async fn github_device_flow_poll(
 mod tests {
     use super::{
         active_asr_is_keyless_for_validation, active_foundry_model_from_prefs,
-        asr_configured_for_provider, asr_transcriptions_url, deleted_style_pack_push_value,
-        failed_pull_state, failed_push_pending_state, fetch_provider_models, is_gemini_base_url,
+        asr_configured_for_provider, asr_transcriptions_url, deleted_history_push_value,
+        deleted_style_pack_push_value, failed_pull_state, failed_push_pending_state,
+        fetch_provider_models, history_session_push_value, is_gemini_base_url,
         is_valid_local_pack_id, is_valid_session_id, llm_configured_for_provider,
         local_asr_release_plan_for_provider, models_url, normalize_foundry_language_hint,
         parse_gemini_model_ids, parse_latest_beta_from_atom, parse_model_ids, persist_settings,
-        release_foundry_runtime_if_inactive, successful_pull_state, successful_push_pending_state,
+        pulled_history_value_to_session, successful_pull_state, successful_push_pending_state,
         sync_deleted_at, validate_foundry_model_alias, ProviderConfig, SettingsWriter,
     };
     use crate::persistence::CredentialsSnapshot;
     use crate::sync_client::SyncApiError;
     use crate::types::{
-        ComboBinding, HotkeyBinding, HotkeyMode, HotkeyTrigger, PendingSyncChange, ShortcutBinding,
-        SyncChangeOperation, SyncEntityKind, SyncState, UserPreferences,
+        ComboBinding, DictationSession, HotkeyBinding, HotkeyMode, HotkeyTrigger, InsertStatus,
+        PendingSyncChange, PolishMode, ShortcutBinding, SyncChangeOperation, SyncEntityKind,
+        SyncState, UserPreferences,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3703,7 +3958,7 @@ mod tests {
     async fn provider_switch_release_requests_foundry_prepare_cancel_first() {
         let runtime = std::sync::Arc::new(crate::asr::local::FoundryLocalRuntime::new());
 
-        release_foundry_runtime_if_inactive(&runtime, true).await;
+        super::release_foundry_runtime_if_inactive(&runtime, true).await;
 
         assert!(runtime.cancel_prepare_requested_for_tests());
     }
@@ -4456,6 +4711,105 @@ mod tests {
         assert!(value["prompt"]
             .as_str()
             .is_some_and(|prompt| !prompt.is_empty()));
+    }
+
+    #[test]
+    fn history_session_push_value_uses_backend_history_fields_without_audio() {
+        let session = DictationSession {
+            id: "history-1".into(),
+            created_at: "2026-05-21T00:00:00Z".into(),
+            raw_transcript: "raw transcript".into(),
+            final_text: "polished transcript".into(),
+            mode: PolishMode::Structured,
+            app_bundle_id: None,
+            app_name: Some("Notes".into()),
+            insert_status: InsertStatus::Inserted,
+            error_code: None,
+            duration_ms: Some(1200),
+            dictionary_entry_count: Some(3),
+            style_pack_id: Some("pack-1".into()),
+            style_pack_name: Some("Meeting".into()),
+            style_pack_prompt_snapshot: Some("Rewrite clearly.".into()),
+            device_id: Some("device-local".into()),
+            updated_at: Some("2026-05-21T00:00:01Z".into()),
+            deleted_at: None,
+            sync_version: Some(7),
+            has_audio_recording: Some(true),
+        };
+
+        let value = history_session_push_value(&session, "device-fallback", 1).unwrap();
+
+        assert_eq!(value["id"], "history-1");
+        assert_eq!(value["device_id"], "device-local");
+        assert_eq!(value["transcript_text"], "raw transcript");
+        assert_eq!(value["polished_text"], "polished transcript");
+        assert_eq!(value["prompt_id"], "pack-1");
+        assert_eq!(value["prompt_name"], "Meeting");
+        assert_eq!(value["prompt_snapshot"], "Rewrite clearly.");
+        assert_eq!(value["source_app"], "Notes");
+        assert_eq!(value["updated_at"], "2026-05-21T00:00:01Z");
+        assert_eq!(value["version"], 7);
+        assert!(value.get("hasAudioRecording").is_none());
+        assert!(value.get("has_audio_recording").is_none());
+        assert!(value.get("audio_path").is_none());
+        assert!(value.get("api_key").is_none());
+    }
+
+    #[test]
+    fn deleted_history_push_value_contains_server_required_tombstone_fields() {
+        let change = PendingSyncChange {
+            id: "change-delete-history".into(),
+            entity: SyncEntityKind::HistoryItem,
+            entity_id: "history-delete".into(),
+            operation: SyncChangeOperation::Delete,
+            queued_at: "2026-05-21T00:00:02Z".into(),
+            attempts: 1,
+            last_error: None,
+        };
+
+        let value = deleted_history_push_value(&change, "device-1");
+
+        assert_eq!(value["id"], "history-delete");
+        assert_eq!(value["device_id"], "device-1");
+        assert_eq!(value["transcript_text"], "Deleted history item");
+        assert_eq!(value["polished_text"], "Deleted history item");
+        assert_eq!(value["updated_at"], "2026-05-21T00:00:02Z");
+        assert_eq!(value["deleted_at"], "2026-05-21T00:00:02Z");
+        assert_eq!(sync_deleted_at(&value), Some("2026-05-21T00:00:02Z"));
+    }
+
+    #[test]
+    fn pulled_history_value_maps_backend_fields_to_local_session() {
+        let value = serde_json::json!({
+            "id": "history-1",
+            "device_id": "device-2",
+            "transcript_text": "raw",
+            "polished_text": "polished",
+            "prompt_id": "pack-1",
+            "prompt_name": "Meeting",
+            "prompt_snapshot": "Prompt snapshot.",
+            "source_app": "Mail",
+            "created_at": "2026-05-21T00:00:00Z",
+            "updated_at": "2026-05-21T00:00:03Z",
+            "version": 3
+        });
+
+        let session = pulled_history_value_to_session(&value).unwrap();
+
+        assert_eq!(session.id, "history-1");
+        assert_eq!(session.raw_transcript, "raw");
+        assert_eq!(session.final_text, "polished");
+        assert_eq!(session.style_pack_id.as_deref(), Some("pack-1"));
+        assert_eq!(session.style_pack_name.as_deref(), Some("Meeting"));
+        assert_eq!(
+            session.style_pack_prompt_snapshot.as_deref(),
+            Some("Prompt snapshot.")
+        );
+        assert_eq!(session.device_id.as_deref(), Some("device-2"));
+        assert_eq!(session.app_name.as_deref(), Some("Mail"));
+        assert_eq!(session.updated_at.as_deref(), Some("2026-05-21T00:00:03Z"));
+        assert_eq!(session.sync_version, Some(3));
+        assert_eq!(session.has_audio_recording, None);
     }
 
     #[test]

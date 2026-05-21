@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::coordinator_state::request_stop_during_starting_state;
 use crate::correction::apply_correction_rules;
-use crate::types::HotkeyMode;
+use crate::types::{HotkeyMode, PendingSyncChange, SyncChangeOperation, SyncEntityKind};
 
 use super::qa::handle_qa_option_edge;
 use super::resources::*;
@@ -13,6 +13,41 @@ use super::*;
 /// 避免微动开关回弹 / 用户手抖双击造成的空转写报错和 ASR session 抢资源。
 const HOTKEY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 const STREAMING_INSERT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
+
+fn queue_history_sync_change(inner: &Arc<Inner>, session: &DictationSession) {
+    if session.raw_transcript.trim().is_empty() || session.final_text.trim().is_empty() {
+        return;
+    }
+    let change = PendingSyncChange {
+        id: format!("change-{}", Uuid::new_v4().simple()),
+        entity: SyncEntityKind::HistoryItem,
+        entity_id: session.id.clone(),
+        operation: SyncChangeOperation::Upsert,
+        queued_at: Utc::now().to_rfc3339(),
+        attempts: 0,
+        last_error: None,
+    };
+    let state = match inner.sync_state.enqueue(change) {
+        Ok(state) => state,
+        Err(error) => {
+            log::warn!("[sync] queue history change failed: {error}");
+            return;
+        }
+    };
+    if let Some(app) = inner.app.lock().clone() {
+        if let Err(error) = app.emit(
+            "sync:push-requested",
+            serde_json::json!({
+                "entity": SyncEntityKind::HistoryItem,
+                "entityId": session.id,
+                "operation": SyncChangeOperation::Upsert,
+                "pendingCount": state.pending_changes.len(),
+            }),
+        ) {
+            log::warn!("[sync] emit push request failed: {error}");
+        }
+    }
+}
 
 /// 跑流式润色路径（opt-in，跨平台）。
 ///
@@ -1340,9 +1375,10 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     }
 
     if raw.text.trim().is_empty() {
+        let created_at = Utc::now().to_rfc3339();
         let session = DictationSession {
             id: Uuid::new_v4().to_string(),
-            created_at: Utc::now().to_rfc3339(),
+            created_at: created_at.clone(),
             raw_transcript: raw.text.clone(),
             final_text: String::new(),
             mode: inner.prefs.get().default_mode,
@@ -1352,6 +1388,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             error_code: Some("emptyTranscript".to_string()),
             duration_ms: Some(raw.duration_ms),
             dictionary_entry_count: Some(enabled_phrases(inner).len() as u32),
+            style_pack_id: None,
+            style_pack_name: None,
+            style_pack_prompt_snapshot: None,
+            device_id: Some(inner.sync_state.get().device_id),
+            updated_at: Some(created_at),
+            deleted_at: None,
+            sync_version: Some(1),
             // empty-transcript（ASR 没识别到任何文字）也保留 wav 标记——这是用户最想
             // 通过原始录音定位"是不是麦克风太小声 / ASR 模型问题"的场景。修 pr_agent
             // "Missing Audio" 反馈。
@@ -1654,6 +1697,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let history_session_id = current_session_id.to_string();
     let history_created_at = Utc::now().to_rfc3339();
     let prefs_snapshot = inner.prefs.get();
+    let device_id = inner.sync_state.get().device_id;
     let session = DictationSession {
         id: history_session_id.clone(),
         created_at: history_created_at.clone(),
@@ -1661,23 +1705,32 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         final_text: polished.clone(),
         mode,
         app_bundle_id: None,
-        app_name: None,
+        app_name: front_app.clone(),
         insert_status: status,
         error_code,
         duration_ms: Some(raw.duration_ms),
         // 历史详情页的"X 个热词"显示：用本次实际命中次数（每个匹配实例算一次），
         // 比"启用词条总数"更能反映本段口述命中了多少。u64 → u32 截断对单段听写足够。
         dictionary_entry_count: Some(total_hits.min(u32::MAX as u64) as u32),
+        style_pack_id: Some(pack.id.clone()),
+        style_pack_name: Some(pack.name.clone()),
+        style_pack_prompt_snapshot: Some(pack.prompt.clone()),
+        device_id: Some(device_id),
+        updated_at: Some(history_created_at),
+        deleted_at: None,
+        sync_version: Some(1),
         // 用 begin_session 时 Recorder::start 返回的实际写盘状态，而不是 prefs 开关——
         // 开关打开但路径创建失败时这里是 false，避免前端渲染播放按钮后端 404。
         has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
     };
     if let Err(e) = inner.history.append_with_retention(
-        session,
+        session.clone(),
         prefs_snapshot.history_retention_days,
         prefs_snapshot.history_max_entries,
     ) {
         log::error!("[coord] history append failed: {e}");
+    } else {
+        queue_history_sync_change(inner, &session);
     }
     let done_message = if tsf_required_insert_failed {
         Some("TSF 未上屏，已禁止非 TSF 兜底".to_string())
