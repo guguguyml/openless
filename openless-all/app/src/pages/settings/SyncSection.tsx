@@ -274,27 +274,32 @@ export function SyncSection() {
               </Btn>
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 380 }}>
+            <div style={{ width: '100%', maxWidth: 380 }}>
               <input
-                type="email"
+                type="text"
                 value={email}
                 onChange={event => setEmail(event.target.value)}
                 placeholder="you@example.com"
-                style={{ ...tallInputStyle, width: '100%' }}
+                style={{ ...inputStyle, width: '100%', marginBottom: 6 }}
               />
-              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 116px 58px', gap: 8, width: '100%', minWidth: 0 }}>
+              <div style={{ display: 'flex', gap: 6, width: '100%', minWidth: 0 }}>
                 <input
                   type="text"
                   inputMode="numeric"
                   value={code}
                   onChange={event => setCode(event.target.value)}
                   placeholder={t('settings.sync.codePlaceholder')}
-                  style={{ ...tallInputStyle, minWidth: 0, width: '100%' }}
+                  style={{ ...inputStyle, minWidth: 20, width: '100%' }}
                 />
-                <Btn size="sm" onClick={() => void requestCode()} disabled={busy !== null || !email.trim()} style={{ ...tallButtonStyle, width: '100%' }}>
+                <Btn size="sm" onClick={() => void requestCode()} disabled={busy !== null || !email.trim()}>
                   {busy === 'code' ? t('settings.sync.sendingCode') : t('settings.sync.sendCode')}
                 </Btn>
-                <Btn size="sm" variant="blue" onClick={() => void verifyLogin()} disabled={busy !== null || !email.trim() || !code.trim()} style={{ ...tallButtonStyle, width: '100%' }}>
+                <Btn
+                  size="sm"
+                  variant="blue"
+                  onClick={() => void verifyLogin()}
+                  disabled={busy !== null || !email.trim() || !code.trim()}
+                >
                   {busy === 'login' ? t('settings.sync.loggingIn') : t('settings.sync.login')}
                 </Btn>
               </div>
