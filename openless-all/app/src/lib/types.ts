@@ -133,6 +133,10 @@ export interface DictionaryEntry {
   enabled: boolean;
   hits: number;
   createdAt: string;
+  updatedAt?: string | null;
+  deletedAt?: string | null;
+  deviceId?: string | null;
+  syncVersion?: number | null;
 }
 
 export interface CorrectionRule {
@@ -141,12 +145,21 @@ export interface CorrectionRule {
   replacement: string;
   enabled: boolean;
   createdAt: string;
+  updatedAt?: string | null;
+  deletedAt?: string | null;
+  deviceId?: string | null;
+  syncVersion?: number | null;
 }
 
 export interface VocabPreset {
   id: string;
   name: string;
   phrases: string[];
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  deletedAt?: string | null;
+  deviceId?: string | null;
+  syncVersion?: number | null;
 }
 
 export interface VocabPresetStore {

@@ -2134,17 +2134,36 @@ impl DictionaryStore {
     pub fn add(&self, phrase: String, note: Option<String>) -> Result<DictionaryEntry> {
         let _guard = self.lock.lock();
         let mut entries = self.read_locked()?;
+        let now = Utc::now().to_rfc3339();
         let entry = DictionaryEntry {
             id: Uuid::new_v4().to_string(),
             phrase,
             note,
             enabled: true,
             hits: 0,
-            created_at: Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: Some(now),
+            deleted_at: None,
+            device_id: None,
+            sync_version: Some(1),
         };
         entries.insert(0, entry.clone());
         self.write_locked(&entries)?;
         Ok(entry)
+    }
+
+    pub fn apply_synced_entry(&self, entry: DictionaryEntry) -> Result<()> {
+        let _guard = self.lock.lock();
+        let mut entries = self.read_locked()?;
+        if let Some(existing) = entries.iter_mut().find(|item| item.id == entry.id) {
+            if dictionary_updated_at(&entry) >= dictionary_updated_at(existing) {
+                *existing = entry;
+            }
+        } else {
+            entries.insert(0, entry);
+        }
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        self.write_locked(&entries)
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
@@ -2165,6 +2184,7 @@ impl DictionaryStore {
         for entry in entries.iter_mut() {
             if entry.id == id {
                 entry.enabled = enabled;
+                entry.updated_at = Some(Utc::now().to_rfc3339());
                 found = true;
                 break;
             }
@@ -2220,6 +2240,14 @@ impl DictionaryStore {
         let json = serde_json::to_vec_pretty(entries).context("encode vocab failed")?;
         atomic_write(&self.path, &json)
     }
+}
+
+fn dictionary_updated_at(entry: &DictionaryEntry) -> &str {
+    entry
+        .updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&entry.created_at)
 }
 
 /// 统计 `needle` 在 `haystack` 中的非重叠出现次数。两侧调用前都应已转小写。
@@ -2281,16 +2309,35 @@ impl CorrectionRuleStore {
         validate_correction_rule_syntax(&pattern, &replacement)?;
         let _guard = self.lock.lock();
         let mut rules = self.read_locked()?;
+        let now = Utc::now().to_rfc3339();
         let rule = CorrectionRule {
             id: Uuid::new_v4().to_string(),
             pattern,
             replacement,
             enabled: true,
-            created_at: Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: Some(now),
+            deleted_at: None,
+            device_id: None,
+            sync_version: Some(1),
         };
         rules.insert(0, rule.clone());
         self.write_locked(&rules)?;
         Ok(rule)
+    }
+
+    pub fn apply_synced_rule(&self, rule: CorrectionRule) -> Result<()> {
+        let _guard = self.lock.lock();
+        let mut rules = self.read_locked()?;
+        if let Some(existing) = rules.iter_mut().find(|item| item.id == rule.id) {
+            if correction_rule_updated_at(&rule) >= correction_rule_updated_at(existing) {
+                *existing = rule;
+            }
+        } else {
+            rules.insert(0, rule);
+        }
+        rules.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        self.write_locked(&rules)
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
@@ -2311,6 +2358,7 @@ impl CorrectionRuleStore {
         for rule in rules.iter_mut() {
             if rule.id == id {
                 rule.enabled = enabled;
+                rule.updated_at = Some(Utc::now().to_rfc3339());
                 found = true;
                 break;
             }
@@ -2329,6 +2377,13 @@ impl CorrectionRuleStore {
         let json = serde_json::to_vec_pretty(rules).context("encode correction rules failed")?;
         atomic_write(&self.path, &json)
     }
+}
+
+fn correction_rule_updated_at(rule: &CorrectionRule) -> &str {
+    rule.updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&rule.created_at)
 }
 
 fn validate_correction_rule_syntax(pattern: &str, replacement: &str) -> Result<()> {
@@ -2605,6 +2660,11 @@ mod tests {
                 id: "test".into(),
                 name: "测试".into(),
                 phrases: vec!["PR".into(), "CI".into()],
+                created_at: None,
+                updated_at: None,
+                deleted_at: None,
+                device_id: None,
+                sync_version: None,
             }],
             overrides: vec![],
             disabled_builtin_preset_ids: vec!["chef".into()],

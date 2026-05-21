@@ -36,7 +36,7 @@ use crate::types::{
     HotkeyStatus, InsertStatus, OutputLanguagePreference, PendingSyncChange, PolishMode,
     ShortcutBinding, StylePack, StylePackKind, StylePackRuntimeDiagnostics, StyleSystemPrompts,
     SyncAuthSession, SyncChangeOperation, SyncEntityKind, SyncSettings, SyncState, UpdateChannel,
-    UserPreferences, VocabPresetStore, WindowsImeStatus,
+    UserPreferences, VocabPreset, VocabPresetStore, WindowsImeStatus,
 };
 
 type CoordinatorState<'a> = State<'a, Arc<Coordinator>>;
@@ -1338,6 +1338,40 @@ fn queue_history_sync_change(
     Ok(())
 }
 
+fn queue_vocab_sync_change(
+    coord: &Coordinator,
+    app: &AppHandle,
+    entity: SyncEntityKind,
+    entity_id: &str,
+    operation: SyncChangeOperation,
+) -> Result<(), String> {
+    let change = crate::types::PendingSyncChange {
+        id: format!("change-{}", uuid::Uuid::new_v4().simple()),
+        entity,
+        entity_id: entity_id.to_string(),
+        operation,
+        queued_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+        last_error: None,
+    };
+    let state = coord
+        .sync_state()
+        .enqueue(change)
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = app.emit(
+        "sync:push-requested",
+        serde_json::json!({
+            "entity": entity,
+            "entityId": entity_id,
+            "operation": operation,
+            "pendingCount": state.pending_changes.len(),
+        }),
+    ) {
+        log::warn!("[sync] emit push request failed: {error}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_sync_auth_session() -> Result<Option<SyncAuthSession>, String> {
     SyncAuthVault::get().map_err(|e| e.to_string())
@@ -1440,6 +1474,7 @@ async fn sync_pull_inner(coord: &Coordinator) -> Result<SyncPullResult, SyncApiE
     let result = client.pull(cursor.as_deref()).await?;
     apply_pulled_style_packs(coord, &result)?;
     apply_pulled_history_items(coord, &result)?;
+    apply_pulled_vocab_items(coord, &result)?;
     let next_state = successful_pull_state(
         coord.sync_state().get(),
         &result.cursor,
@@ -1645,6 +1680,221 @@ fn sync_i64(value: &Value, names: &[&str]) -> Option<i64> {
         .find_map(|name| value.get(*name).and_then(Value::as_i64))
 }
 
+fn sync_bool(value: &Value, names: &[&str]) -> Option<bool> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_bool))
+}
+
+fn sync_u64(value: &Value, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_u64))
+}
+
+fn apply_pulled_vocab_items(
+    coord: &Coordinator,
+    result: &SyncPullResult,
+) -> Result<(), SyncApiError> {
+    for value in &result.dictionary_entries {
+        let id = required_sync_string(value, &["id"], "sync_vocab_invalid", "同步词条缺少 ID")?;
+        if sync_deleted_at(value).is_some() {
+            coord.vocab().remove(&id).map_err(|err| {
+                SyncApiError::local(
+                    "sync_vocab_apply_failed",
+                    format!("同步词条删除写入本地失败：{err}"),
+                    false,
+                )
+            })?;
+            continue;
+        }
+        let entry = pulled_dictionary_value_to_entry(value)?;
+        coord.vocab().apply_synced_entry(entry).map_err(|err| {
+            SyncApiError::local(
+                "sync_vocab_apply_failed",
+                format!("同步词条写入本地失败：{err}"),
+                false,
+            )
+        })?;
+    }
+
+    for value in &result.correction_rules {
+        let id = required_sync_string(
+            value,
+            &["id"],
+            "sync_correction_rule_invalid",
+            "同步纠正规则缺少 ID",
+        )?;
+        if sync_deleted_at(value).is_some() {
+            coord.correction_rules().remove(&id).map_err(|err| {
+                SyncApiError::local(
+                    "sync_correction_rule_apply_failed",
+                    format!("同步纠正规则删除写入本地失败：{err}"),
+                    false,
+                )
+            })?;
+            continue;
+        }
+        let rule = pulled_correction_rule_value_to_rule(value)?;
+        coord
+            .correction_rules()
+            .apply_synced_rule(rule)
+            .map_err(|err| {
+                SyncApiError::local(
+                    "sync_correction_rule_apply_failed",
+                    format!("同步纠正规则写入本地失败：{err}"),
+                    false,
+                )
+            })?;
+    }
+
+    if !result.vocab_presets.is_empty() {
+        let mut store = crate::persistence::list_vocab_presets().map_err(|err| {
+            SyncApiError::local(
+                "sync_vocab_preset_apply_failed",
+                format!("同步词汇预设读取本地失败：{err}"),
+                false,
+            )
+        })?;
+        for value in &result.vocab_presets {
+            apply_pulled_vocab_preset_value(&mut store, value)?;
+        }
+        crate::persistence::save_vocab_presets(&store).map_err(|err| {
+            SyncApiError::local(
+                "sync_vocab_preset_apply_failed",
+                format!("同步词汇预设写入本地失败：{err}"),
+                false,
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn pulled_dictionary_value_to_entry(value: &Value) -> Result<DictionaryEntry, SyncApiError> {
+    let created_at = required_sync_string(
+        value,
+        &["created_at", "createdAt"],
+        "sync_vocab_invalid",
+        "同步词条缺少创建时间",
+    )?;
+    let updated_at = sync_string(value, &["updated_at", "updatedAt"]).unwrap_or(created_at.clone());
+    Ok(DictionaryEntry {
+        id: required_sync_string(value, &["id"], "sync_vocab_invalid", "同步词条缺少 ID")?,
+        phrase: required_sync_string(value, &["phrase"], "sync_vocab_invalid", "同步词条缺少内容")?,
+        note: sync_string(value, &["note"]),
+        enabled: sync_bool(value, &["enabled"]).unwrap_or(true),
+        hits: sync_u64(value, &["hits"]).unwrap_or(0),
+        created_at,
+        updated_at: Some(updated_at),
+        deleted_at: sync_deleted_at(value).map(str::to_string),
+        device_id: sync_string(value, &["device_id", "deviceId"]),
+        sync_version: sync_i64(value, &["sync_version", "syncVersion"]),
+    })
+}
+
+fn pulled_correction_rule_value_to_rule(value: &Value) -> Result<CorrectionRule, SyncApiError> {
+    let created_at = required_sync_string(
+        value,
+        &["created_at", "createdAt"],
+        "sync_correction_rule_invalid",
+        "同步纠正规则缺少创建时间",
+    )?;
+    let updated_at = sync_string(value, &["updated_at", "updatedAt"]).unwrap_or(created_at.clone());
+    Ok(CorrectionRule {
+        id: required_sync_string(
+            value,
+            &["id"],
+            "sync_correction_rule_invalid",
+            "同步纠正规则缺少 ID",
+        )?,
+        pattern: required_sync_string(
+            value,
+            &["pattern"],
+            "sync_correction_rule_invalid",
+            "同步纠正规则缺少匹配内容",
+        )?,
+        replacement: required_sync_string(
+            value,
+            &["replacement"],
+            "sync_correction_rule_invalid",
+            "同步纠正规则缺少替换内容",
+        )?,
+        enabled: sync_bool(value, &["enabled"]).unwrap_or(true),
+        created_at,
+        updated_at: Some(updated_at),
+        deleted_at: sync_deleted_at(value).map(str::to_string),
+        device_id: sync_string(value, &["device_id", "deviceId"]),
+        sync_version: sync_i64(value, &["sync_version", "syncVersion"]),
+    })
+}
+
+fn apply_pulled_vocab_preset_value(
+    store: &mut VocabPresetStore,
+    value: &Value,
+) -> Result<(), SyncApiError> {
+    let sync_id = required_sync_string(
+        value,
+        &["id"],
+        "sync_vocab_preset_invalid",
+        "同步词汇预设缺少 ID",
+    )?;
+    let kind =
+        sync_string(value, &["preset_kind", "presetKind"]).unwrap_or_else(|| "custom".into());
+    let local_id = vocab_preset_local_id(&kind, &sync_id);
+    if sync_deleted_at(value).is_some() {
+        remove_vocab_preset_from_store(store, &kind, &local_id);
+        return Ok(());
+    }
+    if kind == "disabled_builtin" {
+        if !store.disabled_builtin_preset_ids.contains(&local_id) {
+            store.disabled_builtin_preset_ids.push(local_id);
+        }
+        return Ok(());
+    }
+    let created_at = sync_string(value, &["created_at", "createdAt"]);
+    let updated_at = sync_string(value, &["updated_at", "updatedAt"]);
+    let phrases = value
+        .get("phrases")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let preset = VocabPreset {
+        id: local_id.clone(),
+        name: required_sync_string(
+            value,
+            &["name"],
+            "sync_vocab_preset_invalid",
+            "同步词汇预设缺少名称",
+        )?,
+        phrases,
+        created_at,
+        updated_at,
+        deleted_at: sync_deleted_at(value).map(str::to_string),
+        device_id: sync_string(value, &["device_id", "deviceId"]),
+        sync_version: sync_i64(value, &["sync_version", "syncVersion"]),
+    };
+    let target = if kind == "override" {
+        &mut store.overrides
+    } else {
+        &mut store.custom
+    };
+    if let Some(existing) = target.iter_mut().find(|item| item.id == local_id) {
+        if vocab_preset_updated_at(&preset) >= vocab_preset_updated_at(existing) {
+            *existing = preset;
+        }
+    } else {
+        target.push(preset);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn sync_push(
     coord: CoordinatorState<'_>,
@@ -1736,6 +1986,21 @@ fn build_pending_push_changes(
             SyncEntityKind::HistoryItem => {
                 let value = pending_history_change_value(coord, state, change)?;
                 changes.history_items.push(value);
+                pushed_change_ids.insert(change.id.clone());
+            }
+            SyncEntityKind::DictionaryEntry => {
+                let value = pending_dictionary_change_value(coord, state, change)?;
+                changes.dictionary_entries.push(value);
+                pushed_change_ids.insert(change.id.clone());
+            }
+            SyncEntityKind::CorrectionRule => {
+                let value = pending_correction_rule_change_value(coord, state, change)?;
+                changes.correction_rules.push(value);
+                pushed_change_ids.insert(change.id.clone());
+            }
+            SyncEntityKind::VocabPreset => {
+                let value = pending_vocab_preset_change_value(state, change)?;
+                changes.vocab_presets.push(value);
                 pushed_change_ids.insert(change.id.clone());
             }
             _ => {}
@@ -1890,6 +2155,325 @@ fn deleted_history_push_value(change: &PendingSyncChange, device_id: &str) -> Va
         "deleted_at": deleted_at,
         "version": change.attempts as i64 + 1,
     })
+}
+
+fn pending_dictionary_change_value(
+    coord: &Coordinator,
+    state: &SyncState,
+    change: &PendingSyncChange,
+) -> Result<Value, SyncApiError> {
+    match change.operation {
+        SyncChangeOperation::Upsert => {
+            let entry = coord
+                .vocab()
+                .list()
+                .map_err(|err| {
+                    SyncApiError::local(
+                        "sync_vocab_load_failed",
+                        format!("待同步词条读取失败：{err}"),
+                        false,
+                    )
+                })?
+                .into_iter()
+                .find(|item| item.id == change.entity_id)
+                .ok_or_else(|| {
+                    SyncApiError::local("sync_vocab_missing", "待同步词条不存在", false)
+                })?;
+            dictionary_entry_push_value(&entry, &state.device_id, change.attempts as i64 + 1)
+        }
+        SyncChangeOperation::Delete => Ok(deleted_dictionary_entry_push_value(
+            change,
+            &state.device_id,
+        )),
+    }
+}
+
+fn dictionary_entry_push_value(
+    entry: &DictionaryEntry,
+    device_id: &str,
+    version: i64,
+) -> Result<Value, SyncApiError> {
+    if entry.phrase.trim().is_empty() {
+        return Err(SyncApiError::local(
+            "sync_vocab_invalid",
+            "词条内容为空，不能同步",
+            false,
+        ));
+    }
+    let created_at = non_empty_time(&entry.created_at);
+    Ok(json!({
+        "id": entry.id,
+        "device_id": entry.device_id.as_deref().unwrap_or(device_id),
+        "phrase": entry.phrase,
+        "note": entry.note.as_deref().unwrap_or(""),
+        "enabled": entry.enabled,
+        "hits": entry.hits,
+        "created_at": created_at,
+        "updated_at": entry.updated_at.as_deref().filter(|value| !value.trim().is_empty()).unwrap_or(created_at),
+        "deleted_at": entry.deleted_at.as_deref().unwrap_or(""),
+        "sync_version": entry.sync_version.unwrap_or(version),
+    }))
+}
+
+fn deleted_dictionary_entry_push_value(change: &PendingSyncChange, device_id: &str) -> Value {
+    let deleted_at = sync_deleted_time(change);
+    json!({
+        "id": change.entity_id,
+        "device_id": device_id,
+        "phrase": "Deleted dictionary entry",
+        "note": "",
+        "enabled": false,
+        "hits": 0,
+        "created_at": deleted_at,
+        "updated_at": deleted_at,
+        "deleted_at": deleted_at,
+        "sync_version": change.attempts as i64 + 1,
+    })
+}
+
+fn pending_correction_rule_change_value(
+    coord: &Coordinator,
+    state: &SyncState,
+    change: &PendingSyncChange,
+) -> Result<Value, SyncApiError> {
+    match change.operation {
+        SyncChangeOperation::Upsert => {
+            let rule = coord
+                .correction_rules()
+                .list()
+                .map_err(|err| {
+                    SyncApiError::local(
+                        "sync_correction_rule_load_failed",
+                        format!("待同步纠正规则读取失败：{err}"),
+                        false,
+                    )
+                })?
+                .into_iter()
+                .find(|item| item.id == change.entity_id)
+                .ok_or_else(|| {
+                    SyncApiError::local(
+                        "sync_correction_rule_missing",
+                        "待同步纠正规则不存在",
+                        false,
+                    )
+                })?;
+            correction_rule_push_value(&rule, &state.device_id, change.attempts as i64 + 1)
+        }
+        SyncChangeOperation::Delete => {
+            Ok(deleted_correction_rule_push_value(change, &state.device_id))
+        }
+    }
+}
+
+fn correction_rule_push_value(
+    rule: &CorrectionRule,
+    device_id: &str,
+    version: i64,
+) -> Result<Value, SyncApiError> {
+    if rule.pattern.trim().is_empty() || rule.replacement.trim().is_empty() {
+        return Err(SyncApiError::local(
+            "sync_correction_rule_invalid",
+            "纠正规则内容为空，不能同步",
+            false,
+        ));
+    }
+    let created_at = non_empty_time(&rule.created_at);
+    Ok(json!({
+        "id": rule.id,
+        "device_id": rule.device_id.as_deref().unwrap_or(device_id),
+        "pattern": rule.pattern,
+        "replacement": rule.replacement,
+        "enabled": rule.enabled,
+        "created_at": created_at,
+        "updated_at": rule.updated_at.as_deref().filter(|value| !value.trim().is_empty()).unwrap_or(created_at),
+        "deleted_at": rule.deleted_at.as_deref().unwrap_or(""),
+        "sync_version": rule.sync_version.unwrap_or(version),
+    }))
+}
+
+fn deleted_correction_rule_push_value(change: &PendingSyncChange, device_id: &str) -> Value {
+    let deleted_at = sync_deleted_time(change);
+    json!({
+        "id": change.entity_id,
+        "device_id": device_id,
+        "pattern": "Deleted correction rule",
+        "replacement": "Deleted correction rule",
+        "enabled": false,
+        "created_at": deleted_at,
+        "updated_at": deleted_at,
+        "deleted_at": deleted_at,
+        "sync_version": change.attempts as i64 + 1,
+    })
+}
+
+fn pending_vocab_preset_change_value(
+    state: &SyncState,
+    change: &PendingSyncChange,
+) -> Result<Value, SyncApiError> {
+    match change.operation {
+        SyncChangeOperation::Upsert => {
+            let store = crate::persistence::list_vocab_presets().map_err(|err| {
+                SyncApiError::local(
+                    "sync_vocab_preset_load_failed",
+                    format!("待同步词汇预设读取失败：{err}"),
+                    false,
+                )
+            })?;
+            let (kind, local_id, preset) = find_vocab_preset_for_sync_id(&store, &change.entity_id)
+                .ok_or_else(|| {
+                    SyncApiError::local("sync_vocab_preset_missing", "待同步词汇预设不存在", false)
+                })?;
+            Ok(vocab_preset_push_value(
+                kind,
+                &local_id,
+                preset.as_ref(),
+                &state.device_id,
+                change.attempts as i64 + 1,
+            ))
+        }
+        SyncChangeOperation::Delete => {
+            Ok(deleted_vocab_preset_push_value(change, &state.device_id))
+        }
+    }
+}
+
+fn vocab_preset_push_value(
+    kind: &str,
+    local_id: &str,
+    preset: Option<&VocabPreset>,
+    device_id: &str,
+    version: i64,
+) -> Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    let sync_id = vocab_preset_sync_id(kind, local_id);
+    let created_at = preset
+        .and_then(|preset| preset.created_at.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&now);
+    let updated_at = preset
+        .and_then(|preset| preset.updated_at.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(created_at);
+    json!({
+        "id": sync_id,
+        "device_id": preset.and_then(|preset| preset.device_id.as_deref()).unwrap_or(device_id),
+        "name": preset.map(|preset| preset.name.as_str()).unwrap_or(local_id),
+        "phrases": preset.map(|preset| preset.phrases.clone()).unwrap_or_default(),
+        "preset_kind": kind,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "deleted_at": preset.and_then(|preset| preset.deleted_at.as_deref()).unwrap_or(""),
+        "sync_version": preset.and_then(|preset| preset.sync_version).unwrap_or(version),
+    })
+}
+
+fn deleted_vocab_preset_push_value(change: &PendingSyncChange, device_id: &str) -> Value {
+    let deleted_at = sync_deleted_time(change);
+    json!({
+        "id": change.entity_id,
+        "device_id": device_id,
+        "name": "Deleted vocab preset",
+        "phrases": [],
+        "preset_kind": vocab_preset_kind_from_sync_id(&change.entity_id),
+        "created_at": deleted_at,
+        "updated_at": deleted_at,
+        "deleted_at": deleted_at,
+        "sync_version": change.attempts as i64 + 1,
+    })
+}
+
+fn sync_deleted_time(change: &PendingSyncChange) -> String {
+    if change.queued_at.trim().is_empty() {
+        chrono::Utc::now().to_rfc3339()
+    } else {
+        change.queued_at.clone()
+    }
+}
+
+fn non_empty_time(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "1970-01-01T00:00:00Z"
+    } else {
+        value
+    }
+}
+
+fn vocab_preset_sync_id(kind: &str, local_id: &str) -> String {
+    match kind {
+        "override" => format!("override:{local_id}"),
+        "disabled_builtin" => format!("disabled:{local_id}"),
+        _ => local_id.to_string(),
+    }
+}
+
+fn vocab_preset_kind_from_sync_id(sync_id: &str) -> &'static str {
+    if sync_id.starts_with("override:") {
+        "override"
+    } else if sync_id.starts_with("disabled:") {
+        "disabled_builtin"
+    } else {
+        "custom"
+    }
+}
+
+fn vocab_preset_local_id(kind: &str, sync_id: &str) -> String {
+    match kind {
+        "override" => sync_id
+            .strip_prefix("override:")
+            .unwrap_or(sync_id)
+            .to_string(),
+        "disabled_builtin" => sync_id
+            .strip_prefix("disabled:")
+            .unwrap_or(sync_id)
+            .to_string(),
+        _ => sync_id.to_string(),
+    }
+}
+
+fn vocab_preset_updated_at(preset: &VocabPreset) -> &str {
+    preset
+        .updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| preset.created_at.as_deref())
+        .unwrap_or("")
+}
+
+fn remove_vocab_preset_from_store(store: &mut VocabPresetStore, kind: &str, local_id: &str) {
+    match kind {
+        "override" => store.overrides.retain(|item| item.id != local_id),
+        "disabled_builtin" => store
+            .disabled_builtin_preset_ids
+            .retain(|item| item != local_id),
+        _ => store.custom.retain(|item| item.id != local_id),
+    }
+}
+
+fn find_vocab_preset_for_sync_id(
+    store: &VocabPresetStore,
+    sync_id: &str,
+) -> Option<(&'static str, String, Option<VocabPreset>)> {
+    if let Some(local_id) = sync_id.strip_prefix("override:") {
+        return store
+            .overrides
+            .iter()
+            .find(|item| item.id == local_id)
+            .cloned()
+            .map(|preset| ("override", local_id.to_string(), Some(preset)));
+    }
+    if let Some(local_id) = sync_id.strip_prefix("disabled:") {
+        return store
+            .disabled_builtin_preset_ids
+            .iter()
+            .find(|item| item.as_str() == local_id)
+            .map(|id| ("disabled_builtin", id.clone(), None));
+    }
+    store
+        .custom
+        .iter()
+        .find(|item| item.id == sync_id)
+        .cloned()
+        .map(|preset| ("custom", sync_id.to_string(), Some(preset)))
 }
 
 fn successful_push_pending_state(
@@ -2107,27 +2691,60 @@ pub fn list_vocab(coord: CoordinatorState<'_>) -> Result<Vec<DictionaryEntry>, S
 #[tauri::command]
 pub fn add_vocab(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     phrase: String,
     note: Option<String>,
 ) -> Result<DictionaryEntry, String> {
-    coord.vocab().add(phrase, note).map_err(|e| e.to_string())
+    let entry = coord.vocab().add(phrase, note).map_err(|e| e.to_string())?;
+    queue_vocab_sync_change(
+        &coord,
+        &app,
+        SyncEntityKind::DictionaryEntry,
+        &entry.id,
+        SyncChangeOperation::Upsert,
+    )?;
+    Ok(entry)
 }
 
 #[tauri::command]
-pub fn remove_vocab(coord: CoordinatorState<'_>, id: String) -> Result<(), String> {
-    coord.vocab().remove(&id).map_err(|e| e.to_string())
+pub fn remove_vocab(coord: CoordinatorState<'_>, app: AppHandle, id: String) -> Result<(), String> {
+    let exists = coord
+        .vocab()
+        .list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|entry| entry.id == id);
+    coord.vocab().remove(&id).map_err(|e| e.to_string())?;
+    if exists {
+        queue_vocab_sync_change(
+            &coord,
+            &app,
+            SyncEntityKind::DictionaryEntry,
+            &id,
+            SyncChangeOperation::Delete,
+        )?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub fn set_vocab_enabled(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
     coord
         .vocab()
         .set_enabled(&id, enabled)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    queue_vocab_sync_change(
+        &coord,
+        &app,
+        SyncEntityKind::DictionaryEntry,
+        &id,
+        SyncChangeOperation::Upsert,
+    )
 }
 
 #[tauri::command]
@@ -2138,33 +2755,70 @@ pub fn list_correction_rules(coord: CoordinatorState<'_>) -> Result<Vec<Correcti
 #[tauri::command]
 pub fn add_correction_rule(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     pattern: String,
     replacement: String,
 ) -> Result<CorrectionRule, String> {
-    coord
+    let rule = coord
         .correction_rules()
         .add(pattern, replacement)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    queue_vocab_sync_change(
+        &coord,
+        &app,
+        SyncEntityKind::CorrectionRule,
+        &rule.id,
+        SyncChangeOperation::Upsert,
+    )?;
+    Ok(rule)
 }
 
 #[tauri::command]
-pub fn remove_correction_rule(coord: CoordinatorState<'_>, id: String) -> Result<(), String> {
+pub fn remove_correction_rule(
+    coord: CoordinatorState<'_>,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    let exists = coord
+        .correction_rules()
+        .list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|rule| rule.id == id);
     coord
         .correction_rules()
         .remove(&id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if exists {
+        queue_vocab_sync_change(
+            &coord,
+            &app,
+            SyncEntityKind::CorrectionRule,
+            &id,
+            SyncChangeOperation::Delete,
+        )?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub fn set_correction_rule_enabled(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
     coord
         .correction_rules()
         .set_enabled(&id, enabled)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    queue_vocab_sync_change(
+        &coord,
+        &app,
+        SyncEntityKind::CorrectionRule,
+        &id,
+        SyncChangeOperation::Upsert,
+    )
 }
 
 #[tauri::command]
@@ -2173,8 +2827,88 @@ pub fn list_vocab_presets() -> Result<VocabPresetStore, String> {
 }
 
 #[tauri::command]
-pub fn save_vocab_presets(store: VocabPresetStore) -> Result<(), String> {
-    crate::persistence::save_vocab_presets(&store).map_err(|e| e.to_string())
+pub fn save_vocab_presets(
+    coord: CoordinatorState<'_>,
+    app: AppHandle,
+    store: VocabPresetStore,
+) -> Result<(), String> {
+    let previous = crate::persistence::list_vocab_presets().map_err(|e| e.to_string())?;
+    let next = normalize_vocab_preset_store_for_save(store, &previous);
+    crate::persistence::save_vocab_presets(&next).map_err(|e| e.to_string())?;
+    for sync_id in vocab_preset_upsert_ids(&next) {
+        queue_vocab_sync_change(
+            &coord,
+            &app,
+            SyncEntityKind::VocabPreset,
+            &sync_id,
+            SyncChangeOperation::Upsert,
+        )?;
+    }
+    let next_ids: HashSet<String> = vocab_preset_upsert_ids(&next).into_iter().collect();
+    for sync_id in vocab_preset_upsert_ids(&previous) {
+        if !next_ids.contains(&sync_id) {
+            queue_vocab_sync_change(
+                &coord,
+                &app,
+                SyncEntityKind::VocabPreset,
+                &sync_id,
+                SyncChangeOperation::Delete,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_vocab_preset_store_for_save(
+    mut store: VocabPresetStore,
+    previous: &VocabPresetStore,
+) -> VocabPresetStore {
+    let now = chrono::Utc::now().to_rfc3339();
+    normalize_vocab_preset_list_for_save(&mut store.custom, &previous.custom, &now);
+    normalize_vocab_preset_list_for_save(&mut store.overrides, &previous.overrides, &now);
+    store
+}
+
+fn normalize_vocab_preset_list_for_save(
+    presets: &mut [VocabPreset],
+    previous: &[VocabPreset],
+    now: &str,
+) {
+    for preset in presets {
+        let old = previous.iter().find(|item| item.id == preset.id);
+        if preset.created_at.as_deref().unwrap_or("").trim().is_empty() {
+            preset.created_at = old
+                .and_then(|item| item.created_at.clone())
+                .or_else(|| Some(now.to_string()));
+        }
+        let changed = old
+            .map(|item| item.name != preset.name || item.phrases != preset.phrases)
+            .unwrap_or(true);
+        if changed || preset.updated_at.as_deref().unwrap_or("").trim().is_empty() {
+            preset.updated_at = Some(now.to_string());
+        }
+        if preset.sync_version.is_none() {
+            preset.sync_version = old.and_then(|item| item.sync_version).or(Some(1));
+        }
+    }
+}
+
+fn vocab_preset_upsert_ids(store: &VocabPresetStore) -> Vec<String> {
+    let mut ids = Vec::new();
+    ids.extend(store.custom.iter().map(|preset| preset.id.clone()));
+    ids.extend(
+        store
+            .overrides
+            .iter()
+            .map(|preset| vocab_preset_sync_id("override", &preset.id)),
+    );
+    ids.extend(
+        store
+            .disabled_builtin_preset_ids
+            .iter()
+            .map(|id| vocab_preset_sync_id("disabled_builtin", id)),
+    );
+    ids
 }
 
 // ─────────────────────────── dictation lifecycle ───────────────────────────
@@ -3820,21 +4554,24 @@ pub async fn github_device_flow_poll(
 mod tests {
     use super::{
         active_asr_is_keyless_for_validation, active_foundry_model_from_prefs,
-        asr_configured_for_provider, asr_transcriptions_url, deleted_history_push_value,
-        deleted_style_pack_push_value, failed_pull_state, failed_push_pending_state,
-        fetch_provider_models, history_session_push_value, is_gemini_base_url,
-        is_valid_local_pack_id, is_valid_session_id, llm_configured_for_provider,
-        local_asr_release_plan_for_provider, models_url, normalize_foundry_language_hint,
-        parse_gemini_model_ids, parse_latest_beta_from_atom, parse_model_ids, persist_settings,
+        asr_configured_for_provider, asr_transcriptions_url, correction_rule_push_value,
+        deleted_correction_rule_push_value, deleted_dictionary_entry_push_value,
+        deleted_history_push_value, deleted_style_pack_push_value, dictionary_entry_push_value,
+        failed_pull_state, failed_push_pending_state, fetch_provider_models,
+        history_session_push_value, is_gemini_base_url, is_valid_local_pack_id,
+        is_valid_session_id, llm_configured_for_provider, local_asr_release_plan_for_provider,
+        models_url, normalize_foundry_language_hint, parse_gemini_model_ids,
+        parse_latest_beta_from_atom, parse_model_ids, persist_settings,
         pulled_history_value_to_session, successful_pull_state, successful_push_pending_state,
-        sync_deleted_at, validate_foundry_model_alias, ProviderConfig, SettingsWriter,
+        sync_deleted_at, validate_foundry_model_alias, vocab_preset_local_id,
+        vocab_preset_push_value, vocab_preset_sync_id, ProviderConfig, SettingsWriter,
     };
     use crate::persistence::CredentialsSnapshot;
     use crate::sync_client::SyncApiError;
     use crate::types::{
-        ComboBinding, DictationSession, HotkeyBinding, HotkeyMode, HotkeyTrigger, InsertStatus,
-        PendingSyncChange, PolishMode, ShortcutBinding, SyncChangeOperation, SyncEntityKind,
-        SyncState, UserPreferences,
+        ComboBinding, CorrectionRule, DictationSession, DictionaryEntry, HotkeyBinding, HotkeyMode,
+        HotkeyTrigger, InsertStatus, PendingSyncChange, PolishMode, ShortcutBinding,
+        SyncChangeOperation, SyncEntityKind, SyncState, UserPreferences, VocabPreset,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -4810,6 +5547,118 @@ mod tests {
         assert_eq!(session.updated_at.as_deref(), Some("2026-05-21T00:00:03Z"));
         assert_eq!(session.sync_version, Some(3));
         assert_eq!(session.has_audio_recording, None);
+    }
+
+    #[test]
+    fn dictionary_entry_push_value_uses_backend_vocab_fields() {
+        let entry = DictionaryEntry {
+            id: "entry-1".into(),
+            phrase: "FluxVoice".into(),
+            note: Some("product name".into()),
+            enabled: true,
+            hits: 12,
+            created_at: "2026-05-21T01:00:00Z".into(),
+            updated_at: Some("2026-05-21T01:00:01Z".into()),
+            deleted_at: None,
+            device_id: Some("device-local".into()),
+            sync_version: Some(4),
+        };
+
+        let value = dictionary_entry_push_value(&entry, "device-fallback", 1).unwrap();
+
+        assert_eq!(value["id"], "entry-1");
+        assert_eq!(value["device_id"], "device-local");
+        assert_eq!(value["phrase"], "FluxVoice");
+        assert_eq!(value["note"], "product name");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["hits"], 12);
+        assert_eq!(value["updated_at"], "2026-05-21T01:00:01Z");
+        assert_eq!(value["sync_version"], 4);
+    }
+
+    #[test]
+    fn correction_rule_push_value_uses_backend_rule_fields() {
+        let rule = CorrectionRule {
+            id: "rule-1".into(),
+            pattern: "Open Less".into(),
+            replacement: "OpenLess".into(),
+            enabled: true,
+            created_at: "2026-05-21T02:00:00Z".into(),
+            updated_at: Some("2026-05-21T02:00:01Z".into()),
+            deleted_at: None,
+            device_id: None,
+            sync_version: None,
+        };
+
+        let value = correction_rule_push_value(&rule, "device-1", 2).unwrap();
+
+        assert_eq!(value["id"], "rule-1");
+        assert_eq!(value["device_id"], "device-1");
+        assert_eq!(value["pattern"], "Open Less");
+        assert_eq!(value["replacement"], "OpenLess");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["sync_version"], 2);
+    }
+
+    #[test]
+    fn vocab_preset_push_value_separates_override_and_disabled_builtin_ids() {
+        let preset = VocabPreset {
+            id: "chef".into(),
+            name: "Chef".into(),
+            phrases: vec!["mise en place".into()],
+            created_at: Some("2026-05-21T03:00:00Z".into()),
+            updated_at: Some("2026-05-21T03:00:01Z".into()),
+            deleted_at: None,
+            device_id: None,
+            sync_version: None,
+        };
+
+        let override_value =
+            vocab_preset_push_value("override", "chef", Some(&preset), "device-1", 1);
+        let disabled_value =
+            vocab_preset_push_value("disabled_builtin", "chef", None, "device-1", 1);
+
+        assert_eq!(vocab_preset_sync_id("override", "chef"), "override:chef");
+        assert_eq!(
+            vocab_preset_sync_id("disabled_builtin", "chef"),
+            "disabled:chef"
+        );
+        assert_eq!(vocab_preset_local_id("override", "override:chef"), "chef");
+        assert_eq!(
+            vocab_preset_local_id("disabled_builtin", "disabled:chef"),
+            "chef"
+        );
+        assert_eq!(override_value["id"], "override:chef");
+        assert_eq!(override_value["preset_kind"], "override");
+        assert_eq!(override_value["phrases"][0], "mise en place");
+        assert_eq!(disabled_value["id"], "disabled:chef");
+        assert_eq!(disabled_value["preset_kind"], "disabled_builtin");
+    }
+
+    #[test]
+    fn deleted_vocab_payloads_have_required_tombstone_fields() {
+        let dictionary = PendingSyncChange {
+            entity: SyncEntityKind::DictionaryEntry,
+            entity_id: "entry-delete".into(),
+            operation: SyncChangeOperation::Delete,
+            queued_at: "2026-05-21T04:00:00Z".into(),
+            ..Default::default()
+        };
+        let correction = PendingSyncChange {
+            entity: SyncEntityKind::CorrectionRule,
+            entity_id: "rule-delete".into(),
+            operation: SyncChangeOperation::Delete,
+            queued_at: "2026-05-21T04:00:00Z".into(),
+            ..Default::default()
+        };
+
+        let dictionary_value = deleted_dictionary_entry_push_value(&dictionary, "device-1");
+        let correction_value = deleted_correction_rule_push_value(&correction, "device-1");
+
+        assert_eq!(dictionary_value["deleted_at"], "2026-05-21T04:00:00Z");
+        assert_eq!(dictionary_value["phrase"], "Deleted dictionary entry");
+        assert_eq!(correction_value["deleted_at"], "2026-05-21T04:00:00Z");
+        assert_eq!(correction_value["replacement"], "Deleted correction rule");
     }
 
     #[test]

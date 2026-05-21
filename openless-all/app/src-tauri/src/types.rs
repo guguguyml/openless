@@ -245,6 +245,14 @@ pub struct DictionaryEntry {
     /// Swift 写 ISO8601;Rust 也用 String,直接通过。
     #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub sync_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +265,14 @@ pub struct CorrectionRule {
     pub enabled: bool,
     #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub sync_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +281,16 @@ pub struct VocabPreset {
     pub id: String,
     pub name: String,
     pub phrases: Vec<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub sync_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

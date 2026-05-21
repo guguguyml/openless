@@ -1832,6 +1832,10 @@ mod tests {
             replacement: replacement.into(),
             enabled: true,
             created_at: String::new(),
+            updated_at: None,
+            deleted_at: None,
+            device_id: None,
+            sync_version: None,
         }
     }
 
