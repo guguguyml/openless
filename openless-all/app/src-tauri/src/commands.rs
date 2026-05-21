@@ -1868,13 +1868,15 @@ fn apply_preferences_provider_config_payload(
 fn apply_preferences_provider_config_credentials(
     payload: &PreferencesProviderConfigPayload,
 ) -> Result<(), SyncApiError> {
-    CredentialsVault::set(CredentialAccount::AsrEndpoint, &payload.asr_base_url).map_err(|err| {
-        SyncApiError::local(
-            "sync_preferences_save_failed",
-            format!("同步偏好写入 ASR endpoint 失败：{err}"),
-            false,
-        )
-    })?;
+    CredentialsVault::set(CredentialAccount::AsrEndpoint, &payload.asr_base_url).map_err(
+        |err| {
+            SyncApiError::local(
+                "sync_preferences_save_failed",
+                format!("同步偏好写入 ASR endpoint 失败：{err}"),
+                false,
+            )
+        },
+    )?;
     CredentialsVault::set(CredentialAccount::AsrModel, &payload.asr_model_name).map_err(|err| {
         SyncApiError::local(
             "sync_preferences_save_failed",
@@ -1882,20 +1884,24 @@ fn apply_preferences_provider_config_credentials(
             false,
         )
     })?;
-    CredentialsVault::set(CredentialAccount::ArkEndpoint, &payload.llm_base_url).map_err(|err| {
-        SyncApiError::local(
-            "sync_preferences_save_failed",
-            format!("同步偏好写入 LLM endpoint 失败：{err}"),
-            false,
-        )
-    })?;
-    CredentialsVault::set(CredentialAccount::ArkModelId, &payload.llm_model_name).map_err(|err| {
-        SyncApiError::local(
-            "sync_preferences_save_failed",
-            format!("同步偏好写入 LLM model 失败：{err}"),
-            false,
-        )
-    })?;
+    CredentialsVault::set(CredentialAccount::ArkEndpoint, &payload.llm_base_url).map_err(
+        |err| {
+            SyncApiError::local(
+                "sync_preferences_save_failed",
+                format!("同步偏好写入 LLM endpoint 失败：{err}"),
+                false,
+            )
+        },
+    )?;
+    CredentialsVault::set(CredentialAccount::ArkModelId, &payload.llm_model_name).map_err(
+        |err| {
+            SyncApiError::local(
+                "sync_preferences_save_failed",
+                format!("同步偏好写入 LLM model 失败：{err}"),
+                false,
+            )
+        },
+    )?;
     CredentialsVault::set_active_asr_provider(&payload.active_asr_provider).map_err(|err| {
         SyncApiError::local(
             "sync_preferences_save_failed",
@@ -4924,23 +4930,24 @@ pub async fn github_device_flow_poll(
 mod tests {
     use super::{
         active_asr_is_keyless_for_validation, active_foundry_model_from_prefs,
-        asr_configured_for_provider, asr_transcriptions_url, correction_rule_push_value,
-        deleted_correction_rule_push_value, deleted_dictionary_entry_push_value,
-        deleted_history_push_value, deleted_style_pack_push_value, dictionary_entry_push_value,
-        failed_pull_state, failed_push_pending_state, fetch_provider_models,
-        history_session_push_value, is_gemini_base_url, is_valid_local_pack_id,
-        is_valid_session_id, llm_configured_for_provider, local_asr_release_plan_for_provider,
-        models_url, normalize_foundry_language_hint, parse_gemini_model_ids,
-        parse_latest_beta_from_atom, parse_model_ids, persist_settings,
-        preferences_provider_config_payload_from_value, preferences_provider_config_push_values,
-        pulled_history_value_to_session, successful_pull_state, successful_push_pending_state,
-        sync_deleted_at, validate_foundry_model_alias, vocab_preset_local_id,
-        vocab_preset_push_value, vocab_preset_sync_id, PreferencesProviderConfigPayload,
-        ProviderConfig, SettingsWriter, PREFERENCES_PROVIDER_CONFIG_BASE_URL,
-        PREFERENCES_PROVIDER_CONFIG_MODEL_NAME, PREFERENCES_PROVIDER_CONFIG_TYPE,
-        PREFERENCES_SYNC_ENTITY_ID, apply_preferences_provider_config_payload,
+        apply_preferences_provider_config_payload, asr_configured_for_provider,
+        asr_transcriptions_url, correction_rule_push_value, deleted_correction_rule_push_value,
+        deleted_dictionary_entry_push_value, deleted_history_push_value,
+        deleted_style_pack_push_value, dictionary_entry_push_value, failed_pull_state,
+        failed_push_pending_state, fetch_provider_models, history_session_push_value,
+        is_gemini_base_url, is_valid_local_pack_id, is_valid_session_id,
+        llm_configured_for_provider, local_asr_release_plan_for_provider, models_url,
+        normalize_foundry_language_hint, parse_gemini_model_ids, parse_latest_beta_from_atom,
+        parse_model_ids, persist_settings, preferences_provider_config_payload_from_value,
+        preferences_provider_config_push_values, pulled_history_value_to_session,
+        successful_pull_state, successful_push_pending_state, sync_deleted_at,
+        syncable_credential_account, syncable_preferences_value, validate_foundry_model_alias,
+        vocab_preset_local_id, vocab_preset_push_value, vocab_preset_sync_id,
+        PreferencesProviderConfigPayload, ProviderConfig, SettingsWriter,
+        PREFERENCES_PROVIDER_CONFIG_BASE_URL, PREFERENCES_PROVIDER_CONFIG_MODEL_NAME,
+        PREFERENCES_PROVIDER_CONFIG_TYPE, PREFERENCES_SYNC_ENTITY_ID,
     };
-    use crate::persistence::CredentialsSnapshot;
+    use crate::persistence::{CredentialAccount, CredentialsSnapshot};
     use crate::sync_client::SyncApiError;
     use crate::types::{
         ChineseScriptPreference, ComboBinding, CorrectionRule, DictationSession, DictionaryEntry,
@@ -4948,6 +4955,7 @@ mod tests {
         PendingSyncChange, PolishMode, ShortcutBinding, SyncChangeOperation, SyncEntityKind,
         SyncState, UserPreferences, VocabPreset,
     };
+    use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
@@ -4963,6 +4971,45 @@ mod tests {
 
     fn snapshot() -> CredentialsSnapshot {
         CredentialsSnapshot::default()
+    }
+
+    fn assert_no_forbidden_sync_keys(value: &Value) {
+        const FORBIDDEN: &[&str] = &[
+            "apikey",
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "audio",
+            "audiopath",
+            "recording",
+            "recordingfile",
+            "soundblob",
+        ];
+        match value {
+            Value::Object(map) => {
+                for (key, nested) in map {
+                    let normalized = key
+                        .chars()
+                        .filter(|ch| ch.is_ascii_alphanumeric())
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    assert!(
+                        !FORBIDDEN
+                            .iter()
+                            .any(|forbidden| normalized.contains(forbidden)),
+                        "sync payload contains forbidden key: {key}"
+                    );
+                    assert_no_forbidden_sync_keys(nested);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    assert_no_forbidden_sync_keys(item);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]
@@ -5178,6 +5225,45 @@ mod tests {
     }
 
     #[test]
+    fn syncable_credential_account_excludes_api_keys_and_secret_accounts() {
+        assert!(syncable_credential_account(CredentialAccount::ArkEndpoint));
+        assert!(syncable_credential_account(CredentialAccount::ArkModelId));
+        assert!(syncable_credential_account(CredentialAccount::AsrEndpoint));
+        assert!(syncable_credential_account(CredentialAccount::AsrModel));
+
+        for account in [
+            CredentialAccount::VolcengineAppKey,
+            CredentialAccount::VolcengineAccessKey,
+            CredentialAccount::VolcengineResourceId,
+            CredentialAccount::ArkApiKey,
+            CredentialAccount::AsrApiKey,
+            CredentialAccount::AsrVocabularyId,
+        ] {
+            assert!(
+                !syncable_credential_account(account),
+                "sensitive credential account must never enqueue sync: {account:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn syncable_preferences_value_excludes_audio_and_local_only_settings() {
+        let prefs = UserPreferences {
+            record_audio_for_debug: true,
+            audio_recording_max_entries: Some(12),
+            microphone_device_name: "Studio Mic".into(),
+            ..Default::default()
+        };
+
+        let value = syncable_preferences_value(&prefs);
+
+        assert_no_forbidden_sync_keys(&value);
+        assert!(value.get("recordAudioForDebug").is_none());
+        assert!(value.get("audioRecordingMaxEntries").is_none());
+        assert!(value.get("microphoneDeviceName").is_none());
+    }
+
+    #[test]
     fn preferences_provider_config_push_values_only_carries_whitelisted_fields() {
         let prefs = UserPreferences {
             active_asr_provider: "whisper".into(),
@@ -5218,9 +5304,13 @@ mod tests {
         assert_eq!(value["device_id"], "device-1");
         assert_eq!(value["created_at"], "2026-05-21T00:00:00Z");
         assert_eq!(value["updated_at"], "2026-05-21T00:00:00Z");
+        assert_no_forbidden_sync_keys(value);
 
         let payload: PreferencesProviderConfigPayload =
             serde_json::from_str(value["language"].as_str().expect("language payload")).unwrap();
+        let payload_value: Value =
+            serde_json::from_str(value["language"].as_str().expect("language payload")).unwrap();
+        assert_no_forbidden_sync_keys(&payload_value);
         assert_eq!(payload.active_asr_provider, "whisper");
         assert_eq!(payload.active_llm_provider, "ark");
         assert_eq!(payload.asr_base_url, "https://asr.example.com/v1");
@@ -5230,8 +5320,14 @@ mod tests {
         assert_eq!(payload.active_style_pack_id, "custom.meeting");
         assert_eq!(payload.working_languages, vec!["中文", "English"]);
         assert_eq!(payload.translation_target_language, "日语");
-        assert_eq!(payload.chinese_script_preference, ChineseScriptPreference::Traditional);
-        assert_eq!(payload.output_language_preference, OutputLanguagePreference::ZhTw);
+        assert_eq!(
+            payload.chinese_script_preference,
+            ChineseScriptPreference::Traditional
+        );
+        assert_eq!(
+            payload.output_language_preference,
+            OutputLanguagePreference::ZhTw
+        );
         assert!(!value.to_string().contains("secret-asr"));
         assert!(!value.to_string().contains("secret-llm"));
     }
@@ -5268,8 +5364,14 @@ mod tests {
         assert_eq!(prefs.active_style_pack_id, "custom.meeting");
         assert_eq!(prefs.working_languages, vec!["中文", "English"]);
         assert_eq!(prefs.translation_target_language, "日语");
-        assert_eq!(prefs.chinese_script_preference, ChineseScriptPreference::Traditional);
-        assert_eq!(prefs.output_language_preference, OutputLanguagePreference::ZhTw);
+        assert_eq!(
+            prefs.chinese_script_preference,
+            ChineseScriptPreference::Traditional
+        );
+        assert_eq!(
+            prefs.output_language_preference,
+            OutputLanguagePreference::ZhTw
+        );
         assert!(!prefs.launch_at_login);
     }
 
@@ -5957,6 +6059,7 @@ mod tests {
         assert_eq!(value["source_app"], "Notes");
         assert_eq!(value["updated_at"], "2026-05-21T00:00:01Z");
         assert_eq!(value["version"], 7);
+        assert_no_forbidden_sync_keys(&value);
         assert!(value.get("hasAudioRecording").is_none());
         assert!(value.get("has_audio_recording").is_none());
         assert!(value.get("audio_path").is_none());
