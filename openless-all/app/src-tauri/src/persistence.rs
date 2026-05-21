@@ -2580,13 +2580,15 @@ impl SyncAuthVault {
 #[cfg(test)]
 mod tests {
     use super::{
-        chunk_json_payload, list_vocab_presets, read_preferences, save_vocab_presets,
-        sync_style_pack_preferences, validate_correction_rule_syntax, StylePackStore,
-        SyncStateStore, KEYRING_CHUNK_MAX_UTF16_UNITS,
+        chunk_json_payload, list_vocab_presets, read_or_default, read_preferences,
+        save_vocab_presets, sync_style_pack_preferences, validate_correction_rule_syntax,
+        CorrectionRuleStore, DictionaryStore, HistoryStore, StylePackStore,
+        SyncSettingsStore, SyncStateStore, KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
     use crate::types::{
-        builtin_style_packs, CustomStylePrompts, PendingSyncChange, PolishMode, StylePack,
-        StylePackKind, SyncChangeOperation, SyncEntityKind, VocabPreset, VocabPresetStore,
+        builtin_style_packs, CustomStylePrompts, DictationSession, InsertStatus, PendingSyncChange,
+        PolishMode, StylePack, StylePackKind, SyncChangeOperation, SyncEntityKind, SyncSettings,
+        VocabPreset, VocabPresetStore,
     };
     use parking_lot::Mutex;
     use std::fs;
@@ -2714,6 +2716,213 @@ mod tests {
         assert_eq!(reloaded.cursor.as_deref(), Some("cursor-42"));
         assert_eq!(reloaded.pending_changes.len(), 1);
         assert_eq!(reloaded.pending_changes[0].entity_id, "pack-1");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sync_regression_survives_restart_for_style_pack_history_vocab_and_queue() {
+        let tmp: PathBuf = std::env::temp_dir()
+            .join(format!("openless-sync-regression-{}", uuid::Uuid::new_v4()));
+        let assets = tmp.join("assets");
+        fs::create_dir_all(&assets).expect("create temp dir");
+
+        let style_path = tmp.join("style-packs.json");
+        let history_path = tmp.join("history.json");
+        let vocab_path = tmp.join("dictionary.json");
+        let correction_path = tmp.join("correction-rules.json");
+        let sync_settings_path = tmp.join("sync-settings.json");
+        let sync_state_path = tmp.join("sync-state.json");
+
+        let style_store = StylePackStore {
+            path: style_path.clone(),
+            asset_root: assets.clone(),
+            state: Mutex::new(Vec::new()),
+        };
+        style_store
+            .apply_synced_style_pack(synced_style_pack(
+                "local-a",
+                "Shared pack",
+                "2026-05-21T00:00:01Z",
+                Some("market-pack-1"),
+                Some("alice"),
+            ))
+            .expect("apply first style pack");
+        style_store
+            .apply_synced_style_pack(synced_style_pack(
+                "local-b",
+                "Shared pack",
+                "2026-05-21T00:00:02Z",
+                Some("market-pack-1"),
+                Some("alice"),
+            ))
+            .expect("apply second style pack");
+
+        let history_store = HistoryStore {
+            path: history_path.clone(),
+            lock: Mutex::new(()),
+        };
+        history_store
+            .apply_synced_history(DictationSession {
+                id: "history-1".into(),
+                created_at: "2026-05-21T00:00:00Z".into(),
+                raw_transcript: "raw history".into(),
+                final_text: "polished history".into(),
+                mode: PolishMode::Structured,
+                app_bundle_id: None,
+                app_name: Some("Notes".into()),
+                insert_status: InsertStatus::Inserted,
+                error_code: None,
+                duration_ms: Some(1200),
+                dictionary_entry_count: Some(2),
+                style_pack_id: Some("local-a".into()),
+                style_pack_name: Some("Shared pack".into()),
+                style_pack_prompt_snapshot: Some("Rewrite clearly.".into()),
+                device_id: Some("device-local".into()),
+                updated_at: Some("2026-05-21T00:00:01Z".into()),
+                deleted_at: None,
+                sync_version: Some(7),
+                has_audio_recording: Some(true),
+            })
+            .expect("apply history");
+
+        let vocab_store = DictionaryStore {
+            path: vocab_path.clone(),
+            lock: Mutex::new(()),
+        };
+        let vocab_entry = vocab_store
+            .add("OpenLess".into(), Some("brand".into()))
+            .expect("add vocab entry");
+        vocab_store
+            .record_hits("OpenLess OpenLess")
+            .expect("record hits");
+        vocab_store
+            .set_enabled(&vocab_entry.id, false)
+            .expect("disable vocab entry");
+
+        let correction_store = CorrectionRuleStore {
+            path: correction_path.clone(),
+            lock: Mutex::new(()),
+        };
+        correction_store
+            .add("PR".into(), "Public Relations".into())
+            .expect("add correction rule");
+
+        let sync_settings_store = SyncSettingsStore::new_for_path(sync_settings_path.clone());
+        sync_settings_store
+            .set(SyncSettings {
+                enabled: true,
+                server_url: "https://sync.example.com".into(),
+                account_email: Some("user@example.com".into()),
+                device_name: "Desk".into(),
+            })
+            .expect("save sync settings");
+
+        let sync_state_store = SyncStateStore::new_for_path(sync_state_path.clone());
+        sync_state_store
+            .update_cursor(Some("cursor-42".into()), Some("2026-05-21T00:00:03Z".into()))
+            .expect("update cursor");
+        sync_state_store
+            .enqueue(PendingSyncChange {
+                id: "change-style".into(),
+                entity: SyncEntityKind::StylePack,
+                entity_id: "local-a".into(),
+                operation: SyncChangeOperation::Upsert,
+                queued_at: "2026-05-21T00:00:04Z".into(),
+                attempts: 0,
+                last_error: None,
+            })
+            .expect("queue style pack");
+        sync_state_store
+            .enqueue(PendingSyncChange {
+                id: "change-history".into(),
+                entity: SyncEntityKind::HistoryItem,
+                entity_id: "history-1".into(),
+                operation: SyncChangeOperation::Upsert,
+                queued_at: "2026-05-21T00:00:05Z".into(),
+                attempts: 0,
+                last_error: None,
+            })
+            .expect("queue history");
+        sync_state_store
+            .enqueue(PendingSyncChange {
+                id: "change-vocab".into(),
+                entity: SyncEntityKind::DictionaryEntry,
+                entity_id: vocab_entry.id.clone(),
+                operation: SyncChangeOperation::Upsert,
+                queued_at: "2026-05-21T00:00:06Z".into(),
+                attempts: 0,
+                last_error: None,
+            })
+            .expect("queue vocab");
+
+        let reloaded_style_store = StylePackStore {
+            path: style_path.clone(),
+            asset_root: assets,
+            state: Mutex::new(
+                read_or_default::<Vec<StylePack>>(&style_path).expect("reload style packs"),
+            ),
+        };
+        let reloaded_history_store = HistoryStore {
+            path: history_path,
+            lock: Mutex::new(()),
+        };
+        let reloaded_vocab_store = DictionaryStore {
+            path: vocab_path,
+            lock: Mutex::new(()),
+        };
+        let reloaded_correction_store = CorrectionRuleStore {
+            path: correction_path,
+            lock: Mutex::new(()),
+        };
+        let reloaded_sync_settings = SyncSettingsStore::new_for_path(sync_settings_path);
+        let reloaded_sync_state = SyncStateStore::new_for_path(sync_state_path);
+
+        let packs = reloaded_style_store.list().expect("list reloaded packs");
+        assert_eq!(packs.len(), 2);
+        assert!(packs
+            .iter()
+            .any(|pack| pack.id == "local-a" && pack.origin_pack_id.as_deref() == Some("market-pack-1")));
+        assert!(packs
+            .iter()
+            .any(|pack| pack.id == "local-b" && pack.origin_pack_id.as_deref() == Some("market-pack-1")));
+
+        let sessions = reloaded_history_store.list().expect("list reloaded history");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "history-1");
+        assert_eq!(sessions[0].style_pack_id.as_deref(), Some("local-a"));
+        assert_eq!(sessions[0].has_audio_recording, Some(true));
+
+        let vocab = reloaded_vocab_store.list().expect("list reloaded vocab");
+        assert_eq!(vocab.len(), 1);
+        assert_eq!(vocab[0].phrase, "OpenLess");
+        assert_eq!(vocab[0].hits, 2);
+        assert!(!vocab[0].enabled);
+
+        let rules = reloaded_correction_store.list().expect("list reloaded rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "PR");
+
+        let settings = reloaded_sync_settings.get();
+        assert!(settings.enabled);
+        assert_eq!(settings.account_email.as_deref(), Some("user@example.com"));
+        assert_eq!(settings.device_name, "Desk");
+
+        let state = reloaded_sync_state.get();
+        assert_eq!(state.cursor.as_deref(), Some("cursor-42"));
+        assert_eq!(state.pending_changes.len(), 3);
+        assert!(state
+            .pending_changes
+            .iter()
+            .any(|change| change.entity == SyncEntityKind::StylePack && change.entity_id == "local-a"));
+        assert!(state
+            .pending_changes
+            .iter()
+            .any(|change| change.entity == SyncEntityKind::HistoryItem && change.entity_id == "history-1"));
+        assert!(state
+            .pending_changes
+            .iter()
+            .any(|change| change.entity == SyncEntityKind::DictionaryEntry && change.entity_id == vocab_entry.id));
+
         let _ = fs::remove_dir_all(&tmp);
     }
 
