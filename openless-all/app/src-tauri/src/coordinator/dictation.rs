@@ -1922,6 +1922,64 @@ mod tests {
     }
 
     #[test]
+    fn streaming_insert_is_disabled_for_translation_path() {
+        assert!(!streaming_insert_eligible(
+            true,
+            true,
+            PolishMode::Light,
+            false,
+        ));
+    }
+
+    #[test]
+    fn raw_mode_streaming_requires_llm_backed_style_pack() {
+        assert!(!streaming_insert_eligible(
+            true,
+            false,
+            PolishMode::Raw,
+            false,
+        ));
+        assert!(streaming_insert_eligible(
+            true,
+            false,
+            PolishMode::Raw,
+            true,
+        ));
+    }
+
+    #[test]
+    fn translation_success_keeps_llm_output_without_extra_script_rewrite() {
+        let result = finalize_polished_text(
+            "繁體".into(),
+            true,
+            false,
+            PolishMode::Light,
+            &None,
+            ChineseScriptPreference::Simplified,
+            &[],
+            false,
+        );
+
+        assert_eq!(result, "繁體");
+    }
+
+    #[test]
+    fn translation_failure_fallback_still_applies_script_preference() {
+        let result = finalize_polished_text(
+            "繁體".into(),
+            true,
+            false,
+            PolishMode::Light,
+            &Some("translate failed".into()),
+            ChineseScriptPreference::Simplified,
+            &[],
+            false,
+        );
+
+        assert_eq!(result, "繁体");
+    }
+
+    #[test]
     fn batch_asr_chunk_limit_applies_only_to_zhipu() {
         assert_eq!(batch_asr_chunk_limit_ms("zhipu"), Some(30_000));
         assert_eq!(batch_asr_chunk_limit_ms("whisper"), None);

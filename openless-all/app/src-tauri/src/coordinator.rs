@@ -3786,6 +3786,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qa_panel_does_not_steal_pressed_edge_from_active_dictation() {
+        let coordinator = Coordinator::new();
+        coordinator
+            .inner
+            .prefs
+            .set(crate::types::UserPreferences {
+                hotkey: crate::types::HotkeyBinding {
+                    trigger: HotkeyTrigger::RightControl,
+                    mode: HotkeyMode::Toggle,
+                    keys: None,
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        {
+            coordinator.inner.qa_state.lock().panel_visible = true;
+            let mut state = coordinator.inner.state.lock();
+            state.phase = SessionPhase::Starting;
+            state.pending_stop = false;
+        }
+
+        handle_pressed_edge(&coordinator.inner).await;
+
+        let state = coordinator.inner.state.lock();
+        assert_eq!(state.phase, SessionPhase::Starting);
+        assert!(state.pending_stop);
+        assert_eq!(coordinator.inner.qa_state.lock().phase, QaPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn qa_panel_release_edge_is_ignored_when_dictation_is_idle() {
+        let coordinator = Coordinator::new();
+        coordinator.inner.qa_state.lock().panel_visible = true;
+        coordinator
+            .inner
+            .hotkey_trigger_held
+            .store(true, Ordering::SeqCst);
+
+        handle_released_edge(&coordinator.inner).await;
+
+        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
+        assert_eq!(coordinator.inner.qa_state.lock().phase, QaPhase::Idle);
+        assert!(!coordinator.inner.hotkey_trigger_held.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn repeated_pressed_edge_during_hold_session_does_not_restart() {
         let coordinator = Coordinator::new();
         coordinator

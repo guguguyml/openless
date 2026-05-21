@@ -2961,6 +2961,45 @@ mod tests {
     }
 
     #[test]
+    fn compose_translate_prompts_uses_target_language_over_output_preference() {
+        let (system_prompt, user_prompt) = compose_translate_prompts(
+            "把这段翻译一下",
+            "English",
+            &["中文".into()],
+            ChineseScriptPreference::Traditional,
+            Some("Messages (com.apple.MobileSMS)"),
+        );
+
+        assert!(system_prompt.contains("# 任务（中文转写 → 英文翻译）"));
+        assert!(system_prompt.contains("用户的工作语言：中文"));
+        assert!(system_prompt.contains("中文输出偏好：繁体中文"));
+        assert!(system_prompt.contains("当前前台应用：Messages"));
+        assert!(
+            !system_prompt.contains("最终输出语言偏好"),
+            "翻译目标语言应优先于普通输出语言偏好"
+        );
+        assert!(user_prompt.contains("把这段翻译一下"));
+    }
+
+    #[test]
+    fn compose_qa_system_prompt_keeps_context_for_selected_text_question() {
+        let system_prompt = compose_qa_system_prompt(
+            &["中文".into(), "English".into()],
+            ChineseScriptPreference::Simplified,
+            OutputLanguagePreference::En,
+            Some("Xcode (com.apple.dt.Xcode)"),
+        );
+
+        assert!(system_prompt.contains("# 上下文"));
+        assert!(system_prompt.contains("用户的工作语言：中文、English"));
+        assert!(system_prompt.contains("中文输出偏好：简体中文"));
+        assert!(system_prompt.contains("Output language preference: English"));
+        assert!(system_prompt.contains("当前前台应用：Xcode"));
+        assert!(system_prompt.contains("# 任务（基于选区的语音问答）"));
+        assert!(system_prompt.contains("请基于选中内容回答这个问题"));
+    }
+
+    #[test]
     fn codex_oauth_reads_codex_app_auth_file_without_refresh() {
         let exp = unix_now_secs() + 3600;
         let auth_path = write_codex_auth_fixture("acct-openless", exp);
