@@ -1267,6 +1267,43 @@ pub fn replace_sync_queue(
         .map_err(|e| e.to_string())
 }
 
+fn queue_style_pack_sync_change(
+    coord: &Coordinator,
+    app: &AppHandle,
+    pack_id: &str,
+    pack_kind: StylePackKind,
+    operation: SyncChangeOperation,
+) -> Result<(), String> {
+    if pack_kind == StylePackKind::Builtin {
+        return Ok(());
+    }
+    let change = crate::types::PendingSyncChange {
+        id: format!("change-{}", uuid::Uuid::new_v4().simple()),
+        entity: SyncEntityKind::StylePack,
+        entity_id: pack_id.to_string(),
+        operation,
+        queued_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+        last_error: None,
+    };
+    let state = coord
+        .sync_state()
+        .enqueue(change)
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = app.emit(
+        "sync:push-requested",
+        serde_json::json!({
+            "entity": SyncEntityKind::StylePack,
+            "entityId": pack_id,
+            "operation": operation,
+            "pendingCount": state.pending_changes.len(),
+        }),
+    ) {
+        log::warn!("[sync] emit push request failed: {error}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_sync_auth_session() -> Result<Option<SyncAuthSession>, String> {
     SyncAuthVault::get().map_err(|e| e.to_string())
@@ -1699,6 +1736,13 @@ pub fn create_style_pack_from_template(
         .map_err(|e| e.to_string())?;
     let prefs = coord.prefs().get();
     let _ = sync_style_pack_prefs_and_persist(&*coord, &app, prefs)?;
+    queue_style_pack_sync_change(
+        &*coord,
+        &app,
+        &created.id,
+        created.kind,
+        SyncChangeOperation::Upsert,
+    )?;
     Ok(created)
 }
 
@@ -1722,6 +1766,13 @@ pub fn save_style_pack(
         let prefs = coord.prefs().get();
         let _ = sync_style_pack_prefs_and_persist(&*coord, &app, prefs)?;
     }
+    queue_style_pack_sync_change(
+        &*coord,
+        &app,
+        &saved.id,
+        saved.kind,
+        SyncChangeOperation::Upsert,
+    )?;
     Ok(saved)
 }
 
@@ -1745,7 +1796,15 @@ pub fn set_active_style_pack(
     app: AppHandle,
     id: String,
 ) -> Result<StylePack, String> {
-    activate_style_pack_by_id(&coord, &app, &id)
+    let pack = activate_style_pack_by_id(&coord, &app, &id)?;
+    queue_style_pack_sync_change(
+        &*coord,
+        &app,
+        &pack.id,
+        pack.kind,
+        SyncChangeOperation::Upsert,
+    )?;
+    Ok(pack)
 }
 
 #[tauri::command]
@@ -1760,7 +1819,7 @@ pub fn set_style_pack_enabled(
         id,
         enabled
     );
-    coord
+    let changed = coord
         .style_packs()
         .set_enabled(&id, enabled)
         .map_err(|e| e.to_string())?;
@@ -1769,10 +1828,18 @@ pub fn set_style_pack_enabled(
         prefs.active_style_pack_id = default_active_style_pack_id();
     }
     let prefs = sync_style_pack_prefs_and_persist(&*coord, &app, prefs)?;
-    coord
+    let packs = coord
         .style_packs()
         .list_with_active(&prefs.active_style_pack_id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    queue_style_pack_sync_change(
+        &*coord,
+        &app,
+        &changed.id,
+        changed.kind,
+        SyncChangeOperation::Upsert,
+    )?;
+    Ok(packs)
 }
 
 #[tauri::command]
@@ -1799,6 +1866,7 @@ pub fn delete_style_pack(
 ) -> Result<(), String> {
     let mut prefs = coord.prefs().get();
     log::info!("[style-pack] command delete requested id={id}");
+    let deleting = coord.style_packs().get(&id).map_err(|e| e.to_string())?;
     coord
         .style_packs()
         .remove_imported(&id)
@@ -1809,19 +1877,35 @@ pub fn delete_style_pack(
     } else {
         refresh_tray_menu_async(&app);
     }
+    queue_style_pack_sync_change(
+        &*coord,
+        &app,
+        &deleting.id,
+        deleting.kind,
+        SyncChangeOperation::Delete,
+    )?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn import_style_pack_from_zip(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     zip_path: String,
 ) -> Result<StylePack, String> {
     log::info!("[style-pack] command import requested zip_path={zip_path}");
-    coord
+    let imported = coord
         .style_packs()
         .import_from_zip(std::path::Path::new(&zip_path))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    queue_style_pack_sync_change(
+        &*coord,
+        &app,
+        &imported.id,
+        imported.kind,
+        SyncChangeOperation::Upsert,
+    )?;
+    Ok(imported)
 }
 
 #[tauri::command]
@@ -2785,6 +2869,7 @@ pub async fn marketplace_detail(
 #[tauri::command]
 pub async fn marketplace_install(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     pack_id: String,
 ) -> Result<StylePack, String> {
     // 安全校验：pack_id 来自远端 backend，可能含路径遍历 segment。
@@ -2839,15 +2924,24 @@ pub async fn marketplace_install(
     let imported = imported_result?;
 
     // 绑定 origin —— 后续编辑+发布走 derivative / supersede 分支。
-    coord
+    let installed = coord
         .style_packs()
         .set_origin(&imported.id, Some(pack_id), origin_author_login)
-        .map_err(|e| format!("set origin failed: {e}"))
+        .map_err(|e| format!("set origin failed: {e}"))?;
+    queue_style_pack_sync_change(
+        &*coord,
+        &app,
+        &installed.id,
+        installed.kind,
+        SyncChangeOperation::Upsert,
+    )?;
+    Ok(installed)
 }
 
 #[tauri::command]
 pub async fn marketplace_upload(
     coord: CoordinatorState<'_>,
+    app: AppHandle,
     pack_id: String,
     origin_pack_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -2916,11 +3010,24 @@ pub async fn marketplace_upload(
         if let Some(remote_id) = parsed.get("id").and_then(|v| v.as_str()) {
             let prefs2 = coord.prefs().get();
             let dev_user2 = marketplace_dev_user(&prefs2);
-            let _ = coord.style_packs().set_origin(
+            match coord.style_packs().set_origin(
                 &pack_id,
                 Some(remote_id.to_string()),
                 Some(dev_user2),
-            );
+            ) {
+                Ok(updated) => {
+                    queue_style_pack_sync_change(
+                        &*coord,
+                        &app,
+                        &updated.id,
+                        updated.kind,
+                        SyncChangeOperation::Upsert,
+                    )?;
+                }
+                Err(error) => {
+                    log::warn!("[marketplace] set origin after upload failed: {error}");
+                }
+            }
         }
     }
 
