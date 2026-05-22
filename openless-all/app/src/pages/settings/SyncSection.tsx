@@ -13,6 +13,7 @@ import {
 	syncRequestEmailCode,
 	syncVerifyEmailCode,
 } from "../../lib/ipc";
+import { emitSaved } from "../../lib/savedEvent";
 import type { SyncAuthSession, SyncSettings, SyncState } from "../../lib/types";
 import { Btn, Card, Pill } from "../_atoms";
 import { SettingRow, inputStyle } from "./shared";
@@ -31,13 +32,21 @@ export function SyncSection() {
 	const [serverUrl, setServerUrl] = useState("");
 	const [deviceName, setDeviceName] = useState("");
 	const [busy, setBusy] = useState<BusyAction>(null);
-	const [message, setMessage] = useState<string | null>(null);
-	const [error, setError] = useState<string | null>(null);
+	const [codeCooldown, setCodeCooldown] = useState(0);
 
 	const loggedInEmail = session?.accountEmail || settings?.accountEmail || null;
 	const isLoggedIn = Boolean(session?.accessToken && loggedInEmail);
 	const pendingCount = state?.pendingChanges.length ?? 0;
 	const effectiveServerUrl = () => serverUrl.trim() || DEFAULT_SYNC_SERVER_URL;
+	const sendCodeDisabled = busy !== null || !email.trim() || codeCooldown > 0;
+	const sendCodeLabel =
+		busy === "code" ? t("settings.sync.sendingCode") : codeCooldown > 0 ? `${codeCooldown}s` : t("settings.sync.sendCode");
+
+	useEffect(() => {
+		if (codeCooldown <= 0) return;
+		const timer = window.setTimeout(() => setCodeCooldown(seconds => Math.max(0, seconds - 1)), 1000);
+		return () => window.clearTimeout(timer);
+	}, [codeCooldown]);
 
 	const lastSyncText = useMemo(() => {
 		const value = state?.lastSyncAt ?? state?.lastPullAt ?? state?.lastPushAt ?? null;
@@ -74,7 +83,7 @@ export function SyncSection() {
 				setServerUrl(nextSettings.serverUrl || DEFAULT_SYNC_SERVER_URL);
 				setDeviceName(nextSettings.deviceName);
 			} catch (err) {
-				if (!cancelled) setError(formatSyncError(err));
+				if (!cancelled) emitSaved("failed", formatSyncError(err));
 			}
 		})();
 		return () => {
@@ -85,8 +94,6 @@ export function SyncSection() {
 	const saveSettings = async () => {
 		if (!settings) return;
 		setBusy("save");
-		setError(null);
-		setMessage(null);
 		try {
 			const next = await setSyncSettings({
 				...settings,
@@ -97,9 +104,9 @@ export function SyncSection() {
 			setSettings(next);
 			setServerUrl(next.serverUrl || DEFAULT_SYNC_SERVER_URL);
 			setDeviceName(next.deviceName);
-			setMessage(t("settings.sync.saved"));
+			emitSaved("saved", t("settings.sync.saved"));
 		} catch (err) {
-			setError(formatSyncError(err));
+			emitSaved("failed", formatSyncError(err));
 		} finally {
 			setBusy(null);
 		}
@@ -108,8 +115,6 @@ export function SyncSection() {
 	const requestCode = async () => {
 		if (!settings) return;
 		setBusy("code");
-		setError(null);
-		setMessage(null);
 		try {
 			const nextSettings = await setSyncSettings({
 				...settings,
@@ -119,9 +124,10 @@ export function SyncSection() {
 			});
 			setSettings(nextSettings);
 			const result = await syncRequestEmailCode(email.trim());
-			setMessage(t("settings.sync.codeSent", { seconds: result.expiresIn }));
+			setCodeCooldown(60);
+			emitSaved("saved", t("settings.sync.codeSent", { seconds: result.expiresIn }));
 		} catch (err) {
-			setError(formatSyncError(err));
+			emitSaved("failed", formatSyncError(err));
 		} finally {
 			setBusy(null);
 		}
@@ -130,8 +136,6 @@ export function SyncSection() {
 	const verifyLogin = async () => {
 		if (!settings) return;
 		setBusy("login");
-		setError(null);
-		setMessage(null);
 		try {
 			const nextSettings = await setSyncSettings({
 				...settings,
@@ -142,22 +146,22 @@ export function SyncSection() {
 			setSettings(nextSettings);
 			const result = await syncVerifyEmailCode(email.trim(), code.trim());
 			const loginMessage = t("settings.sync.loginSuccess", { email: result.accountEmail });
-			setMessage(loginMessage);
+			emitSaved("saved", loginMessage);
 			setCode("");
 			try {
 				const pullResult = await syncPull();
 				await syncPushPending();
-				setMessage(`${loginMessage} ${t("settings.sync.syncSuccess", { cursor: pullResult.cursor || "0" })}`);
+				emitSaved("saved", `${loginMessage} ${t("settings.sync.syncSuccess", { cursor: pullResult.cursor || "0" })}`);
 			} catch (pullError) {
 				const formatted = formatSyncError(pullError);
 				await setSyncLastError(formatted).catch(error => {
 					console.warn("[sync] save login pull error failed", error);
 				});
-				setError(formatted);
+				emitSaved("failed", formatted);
 			}
 			await refresh();
 		} catch (err) {
-			setError(formatSyncError(err));
+			emitSaved("failed", formatSyncError(err));
 		} finally {
 			setBusy(null);
 		}
@@ -166,15 +170,13 @@ export function SyncSection() {
 	const manualSync = async () => {
 		if (!isLoggedIn) return;
 		setBusy("sync");
-		setError(null);
-		setMessage(null);
 		try {
 			const result = await syncPull();
 			const pushed = await syncPushPending();
 			await refresh();
-			setMessage(t("settings.sync.syncSuccess", { cursor: pushed.cursor || result.cursor || "0" }));
+			emitSaved("saved", t("settings.sync.syncSuccess", { cursor: pushed.cursor || result.cursor || "0" }));
 		} catch (err) {
-			setError(formatSyncError(err));
+			emitSaved("failed", formatSyncError(err));
 		} finally {
 			setBusy(null);
 		}
@@ -183,14 +185,12 @@ export function SyncSection() {
 	const logout = async () => {
 		if (!isLoggedIn) return;
 		setBusy("logout");
-		setError(null);
-		setMessage(null);
 		try {
 			await syncLogoutDevice();
 			await refresh();
-			setMessage(t("settings.sync.logoutSuccess"));
+			emitSaved("saved", t("settings.sync.logoutSuccess"));
 		} catch (err) {
-			setError(formatSyncError(err));
+			emitSaved("failed", formatSyncError(err));
 		} finally {
 			setBusy(null);
 		}
@@ -201,14 +201,12 @@ export function SyncSection() {
 		if (!window.confirm(t("settings.sync.clearConfirmFirst"))) return;
 		if (!window.confirm(t("settings.sync.clearConfirmSecond"))) return;
 		setBusy("clear");
-		setError(null);
-		setMessage(null);
 		try {
 			await syncClearCloudData();
 			await refresh();
-			setMessage(t("settings.sync.clearSuccess"));
+			emitSaved("saved", t("settings.sync.clearSuccess"));
 		} catch (err) {
-			setError(formatSyncError(err));
+			emitSaved("failed", formatSyncError(err));
 		} finally {
 			setBusy(null);
 		}
@@ -285,8 +283,8 @@ export function SyncSection() {
 									placeholder={t("settings.sync.codePlaceholder")}
 									style={{ ...inputStyle, minWidth: 20, width: "100%" }}
 								/>
-								<Btn size="sm" onClick={() => void requestCode()} disabled={busy !== null || !email.trim()}>
-									{busy === "code" ? t("settings.sync.sendingCode") : t("settings.sync.sendCode")}
+								<Btn size="sm" onClick={() => void requestCode()} disabled={sendCodeDisabled}>
+									{sendCodeLabel}
 								</Btn>
 								<Btn
 									size="sm"
@@ -309,9 +307,7 @@ export function SyncSection() {
 					<span style={{ fontSize: 12.5, color: "var(--ol-ink-2)" }}>{lastSyncText}</span>
 				</SettingRow>
 				<SettingRow label={t("settings.sync.pendingLabel")} desc={t("settings.sync.pendingDesc")}>
-					<span style={{ fontSize: 12.5, color: "var(--ol-ink-2)" }}>
-						{t("settings.sync.pendingCount", { count: pendingCount })}
-					</span>
+					<span style={{ fontSize: 12.5, color: "var(--ol-ink-2)" }}>{t("settings.sync.pendingCount", { count: pendingCount })}</span>
 				</SettingRow>
 				<SettingRow label={t("settings.sync.manualSyncLabel")} desc={t("settings.sync.manualSyncDesc")}>
 					<Btn variant="blue" size="sm" onClick={() => void manualSync()} disabled={!isLoggedIn || busy !== null}>
@@ -363,20 +359,6 @@ export function SyncSection() {
 					</div>
 				</SettingRow>
 			</Card>
-
-			{(message || error || state.lastError) && (
-				<Card
-					padding={12}
-					style={{
-						background: error || state.lastError ? "rgba(239,68,68,0.08)" : "rgba(34,197,94,0.08)",
-						borderColor: error || state.lastError ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.22)",
-					}}
-				>
-					<div style={{ fontSize: 12, color: error || state.lastError ? "var(--ol-err)" : "var(--ol-ok)", lineHeight: 1.5 }}>
-						{error || state.lastError || message}
-					</div>
-				</Card>
-			)}
 		</>
 	);
 }
