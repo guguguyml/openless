@@ -3,7 +3,7 @@ import { AutoUpdateGate } from './components/AutoUpdateGate';
 import { Capsule } from './components/Capsule';
 import { FloatingShell } from './components/FloatingShell';
 import { Onboarding } from './components/Onboarding';
-import { detectOS } from './components/WindowChrome';
+import { detectOS, type OS } from './components/WindowChrome';
 import {
   checkAccessibilityPermission,
   checkMicrophonePermission,
@@ -26,11 +26,12 @@ import { HotkeySettingsProvider } from './state/HotkeySettingsContext';
 interface AppProps {
   isCapsule: boolean;
   isQa: boolean;
+  forcedOs?: OS | null;
 }
 
 type Gate = 'checking' | 'onboarding' | 'ready';
 
-export function App({ isCapsule, isQa }: AppProps) {
+export function App({ isCapsule, isQa, forcedOs }: AppProps) {
   if (isCapsule) {
     return <Capsule />;
   }
@@ -38,7 +39,7 @@ export function App({ isCapsule, isQa }: AppProps) {
     return <QaPanel />;
   }
 
-  const os = detectOS();
+  const os = forcedOs ?? detectOS();
   // Windows 启动不应被权限探测阻塞首屏。
   const [gate, setGate] = useState<Gate>(isTauri ? 'checking' : 'ready');
 
@@ -242,7 +243,7 @@ export function App({ isCapsule, isQa }: AppProps) {
   }
   return (
     <HotkeySettingsProvider>
-      {gate === 'onboarding' ? <Onboarding onComplete={() => setGate('ready')} /> : <FloatingShell />}
+      {gate === 'onboarding' ? <Onboarding onComplete={() => setGate('ready')} /> : <FloatingShell os={os} />}
       {gate === 'ready' && <AutoUpdateGate />}
     </HotkeySettingsProvider>
   );
@@ -282,7 +283,7 @@ function StartupShell() {
         }}
       >
         <img src="AppIcon.png" alt="" style={{ width: 18, height: 18, borderRadius: 4 }} />
-        <span>OpenLess 正在启动</span>
+        <span>FluxVoice 正在启动</span>
       </div>
     </div>
   );

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for OpenLess windows",
+  "description": "Default capabilities for FluxVoice windows",
   "windows": ["main", "capsule", "qa"],
   "permissions": [
     "core:default",

@@ -4,7 +4,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "OpenLess",
+        "title": "FluxVoice",
         "width": 1240,
         "height": 800,
         "minWidth": 980,
@@ -19,7 +19,7 @@
       {
         "label": "capsule",
         "url": "index.html?window=capsule",
-        "title": "OpenLess Capsule",
+        "title": "FluxVoice Capsule",
         "width": 220,
         "height": 110,
         "decorations": false,
@@ -36,7 +36,7 @@
       {
         "label": "qa",
         "url": "index.html?window=qa",
-        "title": "OpenLess QA",
+        "title": "FluxVoice QA",
         "width": 380,
         "height": 440,
         "decorations": false,

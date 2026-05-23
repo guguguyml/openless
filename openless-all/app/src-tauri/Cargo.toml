@@ -1,8 +1,8 @@
 [package]
-name = "openless"
-version = "1.3.4-12"
-description = "OpenLess — local voice input that types where your cursor is"
-authors = ["OpenLess"]
+name = "fluxvoice"
+version = "1.3.4-13"
+description = "FluxVoice — local voice input that types where your cursor is"
+authors = ["FluxVoice"]
 edition = "2021"
 rust-version = "1.77"
 

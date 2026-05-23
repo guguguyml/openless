@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenLess",
-  "version": "1.3.4-12",
+  "productName": "FluxVoice",
+  "version": "1.3.4-13",
   "identifier": "com.openless.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
   "app": {
@@ -15,7 +15,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "OpenLess",
+        "title": "FluxVoice",
         "width": 1240,
         "height": 800,
         "minWidth": 980,
@@ -33,7 +33,7 @@
       {
         "label": "capsule",
         "url": "index.html?window=capsule",
-        "title": "OpenLess Capsule",
+        "title": "FluxVoice Capsule",
         "width": 220,
         "height": 110,
         "decorations": false,
@@ -50,7 +50,7 @@
       {
         "label": "qa",
         "url": "index.html?window=qa",
-        "title": "OpenLess QA",
+        "title": "FluxVoice QA",
         "width": 380,
         "height": 440,
         "decorations": false,
@@ -72,7 +72,7 @@
         "style-src": "'self' 'unsafe-inline' https://fonts.googleapis.com",
         "font-src": "'self' https://fonts.gstatic.com",
         "img-src": "'self' asset: http://asset.localhost blob: data:",
-        "connect-src": "'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420",
+      "connect-src": "'self' ipc: http://ipc.localhost http://localhost:1420 http://127.0.0.1:1420 ws://localhost:1420 ws://127.0.0.1:1420",
         "object-src": "'none'",
         "base-uri": "'none'",
         "form-action": "'none'",
