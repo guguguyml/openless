@@ -271,7 +271,7 @@ export function SyncSection() {
 								type="text"
 								value={email}
 								onChange={event => setEmail(event.target.value)}
-								placeholder="you@example.com"
+								placeholder={t("settings.sync.emailPlaceholder")}
 								style={{ ...inputStyle, width: "100%", marginBottom: 6 }}
 							/>
 							<div style={{ display: "flex", gap: 6, width: "100%", minWidth: 0 }}>
