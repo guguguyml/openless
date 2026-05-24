@@ -25,8 +25,8 @@ use crate::coordinator::Coordinator;
 use crate::net;
 use crate::permissions::{self, PermissionStatus};
 use crate::persistence::{
-    sync_style_pack_preferences, CredentialAccount, CredentialsSnapshot, CredentialsVault,
-    PreferencesStore, SyncAuthVault,
+    activate_sync_profile_for_email, sync_style_pack_preferences, CredentialAccount,
+    CredentialsSnapshot, CredentialsVault, PreferencesStore, SyncAuthVault,
 };
 use crate::polish::{
     http_client_builder, CodexOAuthConfig, CodexOAuthCredentials, CodexOAuthLLMProvider, LLMError,
@@ -1710,7 +1710,24 @@ pub async fn sync_verify_email_code(
     email: String,
     code: String,
 ) -> Result<SyncLoginResult, SyncApiError> {
+    let prelogin_settings = coord.sync_settings().get();
+    activate_sync_profile_for_email(email.trim()).map_err(|err| {
+        SyncApiError::local(
+            "sync_profile_activate_failed",
+            format!("同步账号档案切换失败：{err}"),
+            false,
+        )
+    })?;
     let mut settings = coord.sync_settings().get();
+    settings.server_url = prelogin_settings.server_url;
+    settings.device_name = prelogin_settings.device_name;
+    coord.sync_settings().set(settings.clone()).map_err(|err| {
+        SyncApiError::local(
+            "sync_settings_save_failed",
+            format!("同步设置保存失败：{err}"),
+            false,
+        )
+    })?;
     let state = coord.sync_state().get();
     let device_name = settings.device_name.trim().to_string();
     let client = SyncApiClient::new(&settings.server_url, None)?;
@@ -1731,11 +1748,19 @@ pub async fn sync_verify_email_code(
         .await?;
 
     let account_email = result.user.email.clone();
+    activate_sync_profile_for_email(&account_email).map_err(|err| {
+        SyncApiError::local(
+            "sync_profile_activate_failed",
+            format!("同步账号档案切换失败：{err}"),
+            false,
+        )
+    })?;
     SyncAuthVault::set(&SyncAuthSession {
         account_email: account_email.clone(),
         access_token: result.access_token,
         refresh_token: result.refresh_token,
-        access_token_expires_at: None,
+        access_token_expires_at: result.access_token_expires_at,
+        refresh_token_expires_at: result.refresh_token_expires_at,
     })
     .map_err(|err| {
         SyncApiError::local(
@@ -1771,11 +1796,18 @@ pub async fn sync_pull(coord: CoordinatorState<'_>) -> Result<SyncPullResult, Sy
 }
 
 async fn sync_pull_inner(coord: &Coordinator) -> Result<SyncPullResult, SyncApiError> {
-    let settings = coord.sync_settings().get();
-    let session = require_sync_auth_session()?;
     let cursor = coord.sync_state().get().cursor;
-    let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
-    let result = client.pull(cursor.as_deref()).await?;
+    let client = authenticated_sync_client(coord).await?;
+    let result = match client.pull(cursor.as_deref()).await {
+        Ok(result) => result,
+        Err(error) if refresh_after_access_token_error(coord, &error).await? => {
+            authenticated_sync_client(coord)
+                .await?
+                .pull(cursor.as_deref())
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
     apply_pulled_style_packs(coord, &result)?;
     sync_style_pack_preferences_after_pull(coord)?;
     apply_pulled_provider_configs(coord, &result)?;
@@ -2397,11 +2429,18 @@ pub async fn sync_push(
     coord: CoordinatorState<'_>,
     changes: SyncPushChanges,
 ) -> Result<SyncPushResult, SyncApiError> {
-    let settings = coord.sync_settings().get();
-    let session = require_sync_auth_session()?;
     let state = coord.sync_state().get();
-    let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
-    let result = client.push(state.device_id, changes).await?;
+    let client = authenticated_sync_client(&coord).await?;
+    let result = match client.push(state.device_id.clone(), changes.clone()).await {
+        Ok(result) => result,
+        Err(error) if refresh_after_access_token_error(&coord, &error).await? => {
+            authenticated_sync_client(&coord)
+                .await?
+                .push(state.device_id, changes)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
     let mut next_state = coord.sync_state().get();
     next_state.cursor = Some(result.cursor.clone());
     next_state.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
@@ -2429,8 +2468,6 @@ pub async fn sync_push_pending(
 }
 
 async fn sync_push_pending_inner(coord: &Coordinator) -> Result<SyncPushResult, SyncApiError> {
-    let settings = coord.sync_settings().get();
-    let session = require_sync_auth_session()?;
     let state = coord.sync_state().get();
     if state.pending_changes.is_empty() {
         return Ok(SyncPushResult {
@@ -2449,8 +2486,17 @@ async fn sync_push_pending_inner(coord: &Coordinator) -> Result<SyncPushResult, 
         });
     }
 
-    let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
-    let result = client.push(state.device_id.clone(), changes).await?;
+    let client = authenticated_sync_client(coord).await?;
+    let result = match client.push(state.device_id.clone(), changes.clone()).await {
+        Ok(result) => result,
+        Err(error) if refresh_after_access_token_error(coord, &error).await? => {
+            authenticated_sync_client(coord)
+                .await?
+                .push(state.device_id.clone(), changes)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
     let next_state = successful_push_pending_state(
         coord.sync_state().get(),
         &result.cursor,
@@ -3044,11 +3090,255 @@ fn record_sync_push_error(coord: &Coordinator, error: &SyncApiError) {
 
 #[tauri::command]
 pub async fn sync_logout_device(coord: CoordinatorState<'_>) -> Result<SyncOkResult, SyncApiError> {
+    let settings_before_logout = coord.sync_settings().get();
+    let session = SyncAuthVault::get().map_err(|err| {
+        SyncApiError::local(
+            "sync_auth_load_failed",
+            format!("同步登录凭据读取失败：{err}"),
+            false,
+        )
+    })?;
+    let device_id = coord.sync_state().get().device_id;
+    clear_local_sync_login_state(&coord)?;
+    if let Some(session) = session {
+        if let Some(refresh_token) = session
+            .refresh_token
+            .filter(|token| !token.trim().is_empty())
+        {
+            match SyncApiClient::new(settings_before_logout.server_url, None) {
+                Ok(client) => {
+                    if let Err(error) = client.logout_device(device_id, refresh_token).await {
+                        log::warn!("[sync] remote logout failed after local logout: {error}");
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[sync] remote logout client unavailable after local logout: {error}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(SyncOkResult { ok: true })
+}
+
+#[tauri::command]
+pub async fn sync_clear_cloud_data(
+    coord: CoordinatorState<'_>,
+) -> Result<SyncClearCloudDataResult, SyncApiError> {
+    let client = authenticated_sync_client(&coord).await?;
+    let result = match client.clear_cloud_data().await {
+        Ok(result) => result,
+        Err(error) if refresh_after_access_token_error(&coord, &error).await? => {
+            authenticated_sync_client(&coord)
+                .await?
+                .clear_cloud_data()
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
+    coord
+        .sync_state()
+        .update_cursor(None, Some(chrono::Utc::now().to_rfc3339()))
+        .map_err(|err| {
+            SyncApiError::local(
+                "sync_state_save_failed",
+                format!("同步状态保存失败：{err}"),
+                false,
+            )
+        })?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn sync_clear_local_profile_data(
+    coord: CoordinatorState<'_>,
+) -> Result<SyncOkResult, SyncApiError> {
+    SyncAuthVault::clear().map_err(|err| {
+        SyncApiError::local(
+            "sync_auth_clear_failed",
+            format!("同步登录凭据清除失败：{err}"),
+            false,
+        )
+    })?;
+    coord.history().clear().map_err(|err| {
+        SyncApiError::local(
+            "history_clear_failed",
+            format!("历史记录清空失败：{err}"),
+            false,
+        )
+    })?;
+    coord.vocab().clear().map_err(|err| {
+        SyncApiError::local(
+            "dictionary_clear_failed",
+            format!("词汇表清空失败：{err}"),
+            false,
+        )
+    })?;
+    coord.correction_rules().clear().map_err(|err| {
+        SyncApiError::local(
+            "correction_rules_clear_failed",
+            format!("纠正规则清空失败：{err}"),
+            false,
+        )
+    })?;
+    crate::persistence::save_vocab_presets(&VocabPresetStore::default()).map_err(|err| {
+        SyncApiError::local(
+            "vocab_presets_clear_failed",
+            format!("词汇预设清空失败：{err}"),
+            false,
+        )
+    })?;
+    coord
+        .style_packs()
+        .reset_current_profile(coord.prefs())
+        .map_err(|err| {
+            SyncApiError::local(
+                "style_packs_clear_failed",
+                format!("风格包清空失败：{err}"),
+                false,
+            )
+        })?;
+    coord
+        .sync_settings()
+        .set(SyncSettings::default())
+        .map_err(|err| {
+            SyncApiError::local(
+                "sync_settings_clear_failed",
+                format!("同步设置清空失败：{err}"),
+                false,
+            )
+        })?;
+    coord
+        .sync_state()
+        .set(SyncState::default())
+        .map_err(|err| {
+            SyncApiError::local(
+                "sync_state_clear_failed",
+                format!("同步状态清空失败：{err}"),
+                false,
+            )
+        })?;
+    Ok(SyncOkResult { ok: true })
+}
+
+fn require_sync_auth_session() -> Result<SyncAuthSession, SyncApiError> {
+    let session = SyncAuthVault::get().map_err(|err| {
+        SyncApiError::local(
+            "sync_auth_load_failed",
+            format!("同步登录凭据读取失败：{err}"),
+            false,
+        )
+    })?;
+    session
+        .filter(|session| !session.access_token.trim().is_empty())
+        .ok_or_else(|| SyncApiError::local("sync_login_required", "请先登录同步账号", false))
+}
+
+async fn authenticated_sync_client(coord: &Coordinator) -> Result<SyncApiClient, SyncApiError> {
     let settings = coord.sync_settings().get();
     let session = require_sync_auth_session()?;
-    let device_id = coord.sync_state().get().device_id;
-    let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
-    let result = client.logout_device(device_id).await?;
+    let session = if sync_access_token_should_refresh(&session) {
+        refresh_sync_auth_session(coord, &settings.server_url, &session).await?
+    } else {
+        session
+    };
+    SyncApiClient::new(settings.server_url, Some(session.access_token))
+}
+
+fn sync_access_token_should_refresh(session: &SyncAuthSession) -> bool {
+    let Some(expires_at) = session.access_token_expires_at.as_deref() else {
+        return false;
+    };
+    let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at) else {
+        return true;
+    };
+    expires_at.with_timezone(&chrono::Utc) <= chrono::Utc::now() + chrono::Duration::minutes(5)
+}
+
+async fn refresh_after_access_token_error(
+    coord: &Coordinator,
+    error: &SyncApiError,
+) -> Result<bool, SyncApiError> {
+    if !sync_access_token_error(error) {
+        return Ok(false);
+    }
+    let settings = coord.sync_settings().get();
+    let session = require_sync_auth_session()?;
+    let _ = refresh_sync_auth_session(coord, &settings.server_url, &session).await?;
+    Ok(true)
+}
+
+fn sync_access_token_error(error: &SyncApiError) -> bool {
+    error.status == Some(401)
+        && matches!(
+            error.code.as_str(),
+            "token_expired" | "token_revoked" | "invalid_token" | "missing_token"
+        )
+}
+
+async fn refresh_sync_auth_session(
+    coord: &Coordinator,
+    server_url: &str,
+    session: &SyncAuthSession,
+) -> Result<SyncAuthSession, SyncApiError> {
+    let refresh_token = session
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| SyncApiError::local("sync_refresh_required", "请重新登录同步账号", false))?
+        .to_string();
+
+    let client = SyncApiClient::new(server_url, None)?;
+    let result = match client.refresh_token(refresh_token).await {
+        Ok(result) => result,
+        Err(error) => {
+            if sync_refresh_token_error(&error) {
+                clear_local_sync_login_state(coord)?;
+            }
+            return Err(error);
+        }
+    };
+
+    let refreshed = SyncAuthSession {
+        account_email: result.user.email.clone(),
+        access_token: result.access_token,
+        refresh_token: result.refresh_token,
+        access_token_expires_at: result.access_token_expires_at,
+        refresh_token_expires_at: result.refresh_token_expires_at,
+    };
+    SyncAuthVault::set(&refreshed).map_err(|err| {
+        SyncApiError::local(
+            "sync_auth_save_failed",
+            format!("同步登录凭据保存失败：{err}"),
+            false,
+        )
+    })?;
+
+    let mut settings = coord.sync_settings().get();
+    settings.enabled = true;
+    settings.account_email = Some(refreshed.account_email.clone());
+    coord.sync_settings().set(settings).map_err(|err| {
+        SyncApiError::local(
+            "sync_settings_save_failed",
+            format!("同步设置保存失败：{err}"),
+            false,
+        )
+    })?;
+
+    Ok(refreshed)
+}
+
+fn sync_refresh_token_error(error: &SyncApiError) -> bool {
+    error.status == Some(401)
+        || matches!(
+            error.code.as_str(),
+            "invalid_refresh_token" | "refresh_token_expired" | "refresh_token_revoked"
+        )
+}
+
+fn clear_local_sync_login_state(coord: &Coordinator) -> Result<(), SyncApiError> {
     SyncAuthVault::clear().map_err(|err| {
         SyncApiError::local(
             "sync_auth_clear_failed",
@@ -3066,41 +3356,7 @@ pub async fn sync_logout_device(coord: CoordinatorState<'_>) -> Result<SyncOkRes
             false,
         )
     })?;
-    Ok(result)
-}
-
-#[tauri::command]
-pub async fn sync_clear_cloud_data(
-    coord: CoordinatorState<'_>,
-) -> Result<SyncClearCloudDataResult, SyncApiError> {
-    let settings = coord.sync_settings().get();
-    let session = require_sync_auth_session()?;
-    let client = SyncApiClient::new(settings.server_url, Some(session.access_token))?;
-    let result = client.clear_cloud_data().await?;
-    coord
-        .sync_state()
-        .update_cursor(None, Some(chrono::Utc::now().to_rfc3339()))
-        .map_err(|err| {
-            SyncApiError::local(
-                "sync_state_save_failed",
-                format!("同步状态保存失败：{err}"),
-                false,
-            )
-        })?;
-    Ok(result)
-}
-
-fn require_sync_auth_session() -> Result<SyncAuthSession, SyncApiError> {
-    let session = SyncAuthVault::get().map_err(|err| {
-        SyncApiError::local(
-            "sync_auth_load_failed",
-            format!("同步登录凭据读取失败：{err}"),
-            false,
-        )
-    })?;
-    session
-        .filter(|session| !session.access_token.trim().is_empty())
-        .ok_or_else(|| SyncApiError::local("sync_login_required", "请先登录同步账号", false))
+    Ok(())
 }
 
 // ─────────────────────────── history ───────────────────────────
@@ -5346,13 +5602,13 @@ mod tests {
         normalize_foundry_language_hint, parse_gemini_model_ids, parse_latest_beta_from_atom,
         parse_model_ids, persist_settings, preferences_provider_config_payload_from_value,
         preferences_provider_config_push_values, pulled_history_value_to_session,
+        release_foundry_runtime_if_inactive, release_sherpa_runtime_if_inactive,
         successful_pull_state, successful_push_pending_state, sync_deleted_at,
         syncable_credential_account, syncable_preferences_value, validate_foundry_model_alias,
         vocab_preset_local_id, vocab_preset_push_value, vocab_preset_sync_id,
         PreferencesProviderConfigPayload, ProviderConfig, SettingsWriter,
         PREFERENCES_PROVIDER_CONFIG_BASE_URL, PREFERENCES_PROVIDER_CONFIG_MODEL_NAME,
         PREFERENCES_PROVIDER_CONFIG_TYPE, PREFERENCES_SYNC_ENTITY_ID,
-        release_foundry_runtime_if_inactive, release_sherpa_runtime_if_inactive,
     };
     use crate::persistence::{CredentialAccount, CredentialsSnapshot};
     use crate::sync_client::SyncApiError;
@@ -5865,12 +6121,7 @@ mod tests {
             } {
                 return Err(error);
             }
-            if let Some(error) = self
-                .active_asr_provider_sync_error
-                .lock()
-                .unwrap()
-                .clone()
-            {
+            if let Some(error) = self.active_asr_provider_sync_error.lock().unwrap().clone() {
                 return Err(error);
             }
             Ok(())
@@ -6130,7 +6381,10 @@ mod tests {
             .clone()
             .expect("previous settings remain saved");
         assert_eq!(saved.active_asr_provider, previous.active_asr_provider);
-        assert_eq!(saved.microphone_device_name, previous.microphone_device_name);
+        assert_eq!(
+            saved.microphone_device_name,
+            previous.microphone_device_name
+        );
         assert_eq!(
             writer.active_asr_provider_syncs.lock().unwrap().clone(),
             vec!["whisper".to_string()]
@@ -6171,13 +6425,13 @@ mod tests {
             .clone()
             .expect("previous settings remain saved");
         assert_eq!(saved.active_asr_provider, previous.active_asr_provider);
-        assert_eq!(saved.microphone_device_name, previous.microphone_device_name);
+        assert_eq!(
+            saved.microphone_device_name,
+            previous.microphone_device_name
+        );
         assert_eq!(
             writer.active_asr_provider_syncs.lock().unwrap().clone(),
-            vec![
-                "whisper".to_string(),
-                previous.active_asr_provider.clone()
-            ]
+            vec!["whisper".to_string(), previous.active_asr_provider.clone()]
         );
         assert_eq!(*writer.dictation_refreshes.lock().unwrap(), 0);
         assert_eq!(*writer.combo_refreshes.lock().unwrap(), 0);
@@ -6192,8 +6446,7 @@ mod tests {
         let writer = FakeSettingsWriter::default();
         let previous = UserPreferences::default();
         *writer.saved.lock().unwrap() = Some(previous.clone());
-        *writer.write_settings_errors.lock().unwrap() =
-            vec![Some("save failed".to_string()), None];
+        *writer.write_settings_errors.lock().unwrap() = vec![Some("save failed".to_string()), None];
         *writer.active_asr_provider_sync_errors.lock().unwrap() =
             vec![None, Some("rollback failed".to_string())];
         let prefs = UserPreferences {

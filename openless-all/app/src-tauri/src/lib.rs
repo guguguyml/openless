@@ -318,6 +318,7 @@ pub fn run() {
             commands::sync_push_pending,
             commands::sync_logout_device,
             commands::sync_clear_cloud_data,
+            commands::sync_clear_local_profile_data,
             commands::list_history,
             commands::delete_history_entry,
             commands::clear_history,

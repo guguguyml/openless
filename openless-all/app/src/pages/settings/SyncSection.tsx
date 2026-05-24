@@ -7,6 +7,7 @@ import {
 	setSyncSettings,
 	setSyncLastError,
 	syncClearCloudData,
+	syncClearLocalProfileData,
 	syncLogoutDevice,
 	syncPull,
 	syncPushPending,
@@ -18,7 +19,7 @@ import type { SyncAuthSession, SyncSettings, SyncState } from "../../lib/types";
 import { Btn, Card, Pill } from "../_atoms";
 import { SettingRow, inputStyle } from "./shared";
 
-type BusyAction = "code" | "login" | "sync" | "logout" | "clear" | "save" | null;
+type BusyAction = "code" | "login" | "sync" | "logout" | "clear" | "clearLocal" | "save" | null;
 
 const DEFAULT_SYNC_SERVER_URL = "https://sync.example.com";
 
@@ -212,6 +213,21 @@ export function SyncSection() {
 		}
 	};
 
+	const clearLocal = async () => {
+		if (!window.confirm(t("settings.sync.clearLocalConfirm"))) return;
+		if (!window.confirm(t("settings.sync.clearLocalConfirmSecond"))) return;
+		setBusy("clearLocal");
+		try {
+			await syncClearLocalProfileData();
+			await refresh();
+			emitSaved("saved", t("settings.sync.clearLocalSuccess"));
+		} catch (err) {
+			emitSaved("failed", formatSyncError(err));
+		} finally {
+			setBusy(null);
+		}
+	};
+
 	if (!settings || !state) {
 		return (
 			<Card>
@@ -317,6 +333,11 @@ export function SyncSection() {
 				<SettingRow label={t("settings.sync.clearCloudLabel")} desc={t("settings.sync.clearCloudDesc")}>
 					<Btn size="sm" onClick={() => void clearCloud()} disabled={!isLoggedIn || busy !== null}>
 						{busy === "clear" ? t("settings.sync.clearing") : t("settings.sync.clearCloud")}
+					</Btn>
+				</SettingRow>
+				<SettingRow label={t("settings.sync.clearLocalLabel")} desc={t("settings.sync.clearLocalDesc")}>
+					<Btn size="sm" onClick={() => void clearLocal()} disabled={busy !== null}>
+						{busy === "clearLocal" ? t("settings.sync.clearing") : t("settings.sync.clearLocal")}
 					</Btn>
 				</SettingRow>
 			</Card>

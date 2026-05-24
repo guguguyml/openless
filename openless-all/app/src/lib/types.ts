@@ -73,6 +73,7 @@ export interface SyncAuthSession {
   accessToken: string;
   refreshToken: string | null;
   accessTokenExpiresAt: string | null;
+  refreshTokenExpiresAt: string | null;
 }
 
 export interface SyncApiError {

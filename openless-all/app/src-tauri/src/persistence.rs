@@ -20,6 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::types::{
@@ -43,6 +44,9 @@ const CORRECTION_NUM_TOKEN: &str = "{num}";
 const VOCAB_PRESETS_FILE: &str = "vocab-presets.json";
 const SYNC_SETTINGS_FILE: &str = "sync-settings.json";
 const SYNC_STATE_FILE: &str = "sync-state.json";
+const SYNC_PROFILE_FILE: &str = "sync-profile.json";
+const SYNC_PROFILES_DIR: &str = "sync-profiles";
+const DEFAULT_SYNC_PROFILE_ID: &str = "local";
 
 /// 旧版 plaintext JSON 凭据路径。仅作为迁移来源；成功写入系统凭据库后会删除。
 const LEGACY_CREDS_DIR: &str = ".openless";
@@ -132,6 +136,120 @@ fn data_dir() -> Result<PathBuf> {
 fn ensure_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("create dir failed: {}", dir.display()))?;
     Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SyncProfileState {
+    active_profile_id: String,
+}
+
+impl Default for SyncProfileState {
+    fn default() -> Self {
+        Self {
+            active_profile_id: DEFAULT_SYNC_PROFILE_ID.to_string(),
+        }
+    }
+}
+
+fn sync_profile_state_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join(SYNC_PROFILE_FILE))
+}
+
+fn active_sync_profile_id() -> Result<String> {
+    let path = sync_profile_state_path()?;
+    let state = read_or_default::<SyncProfileState>(&path).unwrap_or_default();
+    let trimmed = state.active_profile_id.trim();
+    if trimmed.is_empty() {
+        Ok(DEFAULT_SYNC_PROFILE_ID.to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn sync_profile_dir(profile_id: &str) -> Result<PathBuf> {
+    let dir = data_dir()?
+        .join(SYNC_PROFILES_DIR)
+        .join(profile_id.trim().if_empty(DEFAULT_SYNC_PROFILE_ID));
+    ensure_dir(&dir)?;
+    Ok(dir)
+}
+
+fn active_sync_profile_dir() -> Result<PathBuf> {
+    let profile_id = active_sync_profile_id()?;
+    sync_profile_dir(&profile_id)
+}
+
+fn sync_profile_file(file_name: &str) -> Result<PathBuf> {
+    let path = active_sync_profile_dir()?.join(file_name);
+    migrate_legacy_sync_profile_file(file_name, &path)?;
+    Ok(path)
+}
+
+fn sync_profile_assets_dir(dir_name: &str) -> Result<PathBuf> {
+    let dir = active_sync_profile_dir()?.join(dir_name);
+    ensure_dir(&dir)?;
+    Ok(dir)
+}
+
+fn migrate_legacy_sync_profile_file(file_name: &str, profile_path: &Path) -> Result<()> {
+    if active_sync_profile_id()? != DEFAULT_SYNC_PROFILE_ID || profile_path.exists() {
+        return Ok(());
+    }
+    let legacy_path = data_dir()?.join(file_name);
+    if !legacy_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = profile_path.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::copy(&legacy_path, profile_path).with_context(|| {
+        format!(
+            "migrate legacy sync profile file {} to {}",
+            legacy_path.display(),
+            profile_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub fn activate_sync_profile_for_email(email: &str) -> Result<String> {
+    let profile_id = sync_profile_id_for_email(email);
+    let path = sync_profile_state_path()?;
+    let state = SyncProfileState {
+        active_profile_id: profile_id.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&state).context("encode sync profile state failed")?;
+    atomic_write(&path, &json)?;
+    let _ = sync_profile_dir(&profile_id)?;
+    Ok(profile_id)
+}
+
+fn sync_profile_id_for_email(email: &str) -> String {
+    let normalized = email.trim().to_lowercase();
+    if normalized.is_empty() {
+        return DEFAULT_SYNC_PROFILE_ID.to_string();
+    }
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("account-{hex}")
+}
+
+trait IfEmpty {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
+}
+
+impl IfEmpty for str {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
+    }
 }
 
 /// 本地 ASR 模型根目录：`<data_dir>/models/qwen3-asr/`。
@@ -910,15 +1028,15 @@ fn write_account(root: &mut CredsRoot, account: CredentialAccount, value: Option
 
 pub struct HistoryStore {
     path: PathBuf,
+    profiled: bool,
     lock: Mutex<()>,
 }
 
 impl HistoryStore {
     pub fn new() -> Result<Self> {
-        let dir = data_dir()?;
-        ensure_dir(&dir)?;
         Ok(Self {
-            path: dir.join(HISTORY_FILE),
+            path: sync_profile_file(HISTORY_FILE)?,
+            profiled: true,
             lock: Mutex::new(()),
         })
     }
@@ -1020,12 +1138,20 @@ impl HistoryStore {
     }
 
     fn read_locked(&self) -> Result<Vec<DictationSession>> {
-        read_or_default::<Vec<DictationSession>>(&self.path)
+        read_or_default::<Vec<DictationSession>>(&self.current_path()?)
     }
 
     fn write_locked(&self, sessions: &[DictationSession]) -> Result<()> {
         let json = serde_json::to_vec_pretty(sessions).context("encode history failed")?;
-        atomic_write(&self.path, &json)
+        atomic_write(&self.current_path()?, &json)
+    }
+
+    fn current_path(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_file(HISTORY_FILE)
+        } else {
+            Ok(self.path.clone())
+        }
     }
 }
 
@@ -1041,14 +1167,19 @@ fn history_updated_at(session: &DictationSession) -> &str {
 
 pub struct PreferencesStore {
     path: PathBuf,
+    profile_id: Mutex<String>,
+    profiled: bool,
     state: Mutex<UserPreferences>,
 }
 
 impl PreferencesStore {
     pub fn new() -> Result<Self> {
-        let dir = data_dir()?;
-        ensure_dir(&dir)?;
-        let path = dir.join(PREFERENCES_FILE);
+        let profile_id = active_sync_profile_id()?;
+        let path = sync_profile_file(PREFERENCES_FILE)?;
+        Ok(Self::new_profiled(path, profile_id))
+    }
+
+    fn new_profiled(path: PathBuf, profile_id: String) -> Self {
         let prefs = if path.exists() {
             read_preferences(&path).unwrap_or_else(|e| {
                 log::warn!(
@@ -1061,21 +1192,69 @@ impl PreferencesStore {
         } else {
             UserPreferences::default()
         };
-        Ok(Self {
+        Self {
             path,
+            profile_id: Mutex::new(profile_id),
+            profiled: true,
             state: Mutex::new(prefs),
-        })
+        }
     }
 
     pub fn get(&self) -> UserPreferences {
+        if let Err(error) = self.ensure_current_profile_loaded() {
+            log::warn!("[prefs] refresh profile failed: {error}");
+        }
         self.state.lock().clone()
     }
 
     pub fn set(&self, prefs: UserPreferences) -> Result<()> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let json = serde_json::to_vec_pretty(&prefs).context("encode prefs failed")?;
-        atomic_write(&self.path, &json)?;
+        atomic_write(&path, &json)?;
         let mut guard = self.state.lock();
         *guard = prefs;
+        Ok(())
+    }
+
+    pub fn reset_current_profile(&self) -> Result<UserPreferences> {
+        let prefs = UserPreferences::default();
+        self.set(prefs.clone())?;
+        Ok(prefs)
+    }
+
+    fn current_path(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_file(PREFERENCES_FILE)
+        } else {
+            Ok(self.path.clone())
+        }
+    }
+
+    fn ensure_current_profile_loaded(&self) -> Result<()> {
+        if !self.profiled {
+            return Ok(());
+        }
+        let active_profile = active_sync_profile_id()?;
+        let mut profile_guard = self.profile_id.lock();
+        if *profile_guard == active_profile {
+            return Ok(());
+        }
+        let path = sync_profile_file(PREFERENCES_FILE)?;
+        let prefs = if path.exists() {
+            read_preferences(&path).unwrap_or_else(|error| {
+                log::warn!(
+                    "[prefs] load {} failed, using defaults: {}",
+                    path.display(),
+                    error
+                );
+                UserPreferences::default()
+            })
+        } else {
+            UserPreferences::default()
+        };
+        *self.state.lock() = prefs;
+        *profile_guard = active_profile;
         Ok(())
     }
 }
@@ -1084,14 +1263,15 @@ impl PreferencesStore {
 
 pub struct SyncSettingsStore {
     path: PathBuf,
+    profile_id: Mutex<String>,
+    profiled: bool,
     state: Mutex<SyncSettings>,
 }
 
 impl SyncSettingsStore {
     pub fn new() -> Result<Self> {
-        let dir = data_dir()?;
-        ensure_dir(&dir)?;
-        let path = dir.join(SYNC_SETTINGS_FILE);
+        let profile_id = active_sync_profile_id()?;
+        let path = sync_profile_file(SYNC_SETTINGS_FILE)?;
         let settings = read_or_default::<SyncSettings>(&path).unwrap_or_else(|error| {
             log::warn!(
                 "[sync] load {} failed, using defaults: {}",
@@ -1102,6 +1282,8 @@ impl SyncSettingsStore {
         });
         Ok(Self {
             path,
+            profile_id: Mutex::new(profile_id),
+            profiled: true,
             state: Mutex::new(settings),
         })
     }
@@ -1111,35 +1293,72 @@ impl SyncSettingsStore {
         let settings = read_or_default::<SyncSettings>(&path).unwrap_or_default();
         Self {
             path,
+            profile_id: Mutex::new(DEFAULT_SYNC_PROFILE_ID.to_string()),
+            profiled: false,
             state: Mutex::new(settings),
         }
     }
 
     pub fn get(&self) -> SyncSettings {
+        if let Err(error) = self.ensure_current_profile_loaded() {
+            log::warn!("[sync] refresh sync settings profile failed: {error}");
+        }
         self.state.lock().clone()
     }
 
     pub fn set(&self, settings: SyncSettings) -> Result<()> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let json = serde_json::to_vec_pretty(&settings).context("encode sync settings failed")?;
-        atomic_write(&self.path, &json)?;
+        atomic_write(&path, &json)?;
         *self.state.lock() = settings;
+        Ok(())
+    }
+
+    fn current_path(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_file(SYNC_SETTINGS_FILE)
+        } else {
+            Ok(self.path.clone())
+        }
+    }
+
+    fn ensure_current_profile_loaded(&self) -> Result<()> {
+        if !self.profiled {
+            return Ok(());
+        }
+        let active_profile = active_sync_profile_id()?;
+        let mut profile_guard = self.profile_id.lock();
+        if *profile_guard == active_profile {
+            return Ok(());
+        }
+        let path = sync_profile_file(SYNC_SETTINGS_FILE)?;
+        let settings = read_or_default::<SyncSettings>(&path).unwrap_or_default();
+        *self.state.lock() = settings;
+        *profile_guard = active_profile;
         Ok(())
     }
 }
 
 pub struct SyncStateStore {
     path: PathBuf,
+    profile_id: Mutex<String>,
+    profiled: bool,
     state: Mutex<SyncState>,
 }
 
 impl SyncStateStore {
     pub fn new() -> Result<Self> {
-        let dir = data_dir()?;
-        ensure_dir(&dir)?;
-        Ok(Self::new_for_path(dir.join(SYNC_STATE_FILE)))
+        let profile_id = active_sync_profile_id()?;
+        let path = sync_profile_file(SYNC_STATE_FILE)?;
+        Ok(Self::new_profiled(path, profile_id))
     }
 
     fn new_for_path(path: PathBuf) -> Self {
+        Self::new_unprofiled(path)
+    }
+
+    fn new_profiled(path: PathBuf, profile_id: String) -> Self {
         let mut state = read_or_default::<SyncState>(&path).unwrap_or_else(|error| {
             log::warn!(
                 "[sync] load {} failed, using defaults: {}",
@@ -1158,11 +1377,22 @@ impl SyncStateStore {
         }
         Self {
             path,
+            profile_id: Mutex::new(profile_id),
+            profiled: true,
             state: Mutex::new(state),
         }
     }
 
+    fn new_unprofiled(path: PathBuf) -> Self {
+        let mut store = Self::new_profiled(path, DEFAULT_SYNC_PROFILE_ID.to_string());
+        store.profiled = false;
+        store
+    }
+
     pub fn get(&self) -> SyncState {
+        if let Err(error) = self.ensure_current_profile_loaded() {
+            log::warn!("[sync] refresh sync state profile failed: {error}");
+        }
         self.state.lock().clone()
     }
 
@@ -1170,9 +1400,43 @@ impl SyncStateStore {
         if state.device_id.trim().is_empty() {
             return Err(anyhow!("sync device id is empty"));
         }
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let json = serde_json::to_vec_pretty(&state).context("encode sync state failed")?;
-        atomic_write(&self.path, &json)?;
+        atomic_write(&path, &json)?;
         *self.state.lock() = state;
+        Ok(())
+    }
+
+    fn current_path(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_file(SYNC_STATE_FILE)
+        } else {
+            Ok(self.path.clone())
+        }
+    }
+
+    fn ensure_current_profile_loaded(&self) -> Result<()> {
+        if !self.profiled {
+            return Ok(());
+        }
+        let active_profile = active_sync_profile_id()?;
+        let mut profile_guard = self.profile_id.lock();
+        if *profile_guard == active_profile {
+            return Ok(());
+        }
+        let path = sync_profile_file(SYNC_STATE_FILE)?;
+        let mut state = read_or_default::<SyncState>(&path).unwrap_or_default();
+        if state.device_id.trim().is_empty() {
+            state.device_id = SyncState::default().device_id;
+        }
+        if !path.exists() {
+            if let Ok(json) = serde_json::to_vec_pretty(&state) {
+                let _ = atomic_write(&path, &json);
+            }
+        }
+        *self.state.lock() = state;
+        *profile_guard = active_profile;
         Ok(())
     }
 
@@ -1255,60 +1519,29 @@ struct StylePackArchiveManifest {
 pub struct StylePackStore {
     path: PathBuf,
     asset_root: PathBuf,
+    profile_id: Mutex<String>,
+    profiled: bool,
     state: Mutex<Vec<StylePack>>,
 }
 
 impl StylePackStore {
     pub fn new(prefs: &PreferencesStore) -> Result<Self> {
-        let dir = data_dir()?;
-        ensure_dir(&dir)?;
-        let path = dir.join(STYLE_PACKS_FILE);
-        let asset_root = dir.join(STYLE_PACK_ASSETS_DIR);
-        ensure_dir(&asset_root)?;
-
-        let mut packs = if path.exists() {
-            read_or_default::<Vec<StylePack>>(&path).unwrap_or_else(|error| {
-                log::warn!(
-                    "[style-packs] load {} failed, using builtin defaults: {}",
-                    path.display(),
-                    error
-                );
-                Vec::new()
-            })
-        } else {
-            Vec::new()
-        };
-
-        let mut prefs_snapshot = prefs.get();
-        let mut changed = migrate_style_packs_from_preferences(&mut packs, &prefs_snapshot);
-        if ensure_at_least_one_style_pack_enabled(&mut packs) {
-            changed = true;
-        }
-        let active_pref_for_log = prefs_snapshot.active_style_pack_id.clone();
-        let enabled_modes_for_log = prefs_snapshot.enabled_modes.clone();
-        if sync_style_pack_preferences(&mut prefs_snapshot, &packs) {
-            prefs.set(prefs_snapshot)?;
-        }
-        if changed {
-            write_style_packs_file(&path, &packs)?;
-        }
-        log::info!(
-            "[style-pack] store ready: file={} packs={} changed={} active_pref={} enabled_modes={:?}",
-            path.display(),
-            packs.len(),
-            changed,
-            active_pref_for_log,
-            enabled_modes_for_log
-        );
+        let profile_id = active_sync_profile_id()?;
+        let path = sync_profile_file(STYLE_PACKS_FILE)?;
+        let asset_root = sync_profile_assets_dir(STYLE_PACK_ASSETS_DIR)?;
+        let packs = load_style_packs_for_profile(&path, Some(prefs))?;
 
         Ok(Self {
             path,
             asset_root,
+            profile_id: Mutex::new(profile_id),
+            profiled: true,
             state: Mutex::new(packs),
         })
     }
 
     pub fn list(&self) -> Result<Vec<StylePack>> {
+        self.ensure_current_profile_loaded()?;
         Ok(self.state.lock().clone())
     }
 
@@ -1321,6 +1554,7 @@ impl StylePackStore {
     }
 
     pub fn get(&self, id: &str) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
         self.state
             .lock()
             .iter()
@@ -1330,6 +1564,7 @@ impl StylePackStore {
     }
 
     pub fn get_or_default_active(&self, active_style_pack_id: &str) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
         let packs = self.state.lock().clone();
         if let Some(pack) = packs
             .iter()
@@ -1355,6 +1590,8 @@ impl StylePackStore {
     /// 跟 ZIP 导入不同：没有 manifest.json、没有 assets，纯空白模板。
     /// 调用方负责 set `prefs.active_style_pack_id` 等高层 wiring（这里只管落盘）。
     pub fn create_from_template(&self, template: StylePack) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let mut packs = self.state.lock();
         let base_id = if template.id.trim().is_empty() {
             format!("imported-{}", Uuid::new_v4().simple())
@@ -1371,7 +1608,7 @@ impl StylePackStore {
         pack.active = false;
         pack.enabled = true;
         packs.push(pack.clone());
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         log::info!(
             "[style-pack] created from template id={} base_mode={:?} prompt_chars={} examples={}",
             pack.id,
@@ -1383,6 +1620,8 @@ impl StylePackStore {
     }
 
     pub fn upsert(&self, incoming: StylePack) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let mut packs = self.state.lock();
         let index = packs
             .iter()
@@ -1391,7 +1630,7 @@ impl StylePackStore {
         let existing = packs[index].clone();
         let updated = merge_style_pack_update(existing, incoming)?;
         packs[index] = updated.clone();
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         log::info!(
             "[style-pack] saved id={} kind={:?} base_mode={:?} prompt_chars={} examples={} tags={} version={}",
             updated.id,
@@ -1407,6 +1646,8 @@ impl StylePackStore {
 
     pub fn apply_synced_style_pack(&self, incoming: StylePack) -> Result<StylePack> {
         let incoming = normalize_synced_style_pack(incoming)?;
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let mut packs = self.state.lock();
         if let Some(index) = packs.iter().position(|pack| pack.id == incoming.id) {
             if !synced_style_pack_is_newer(&packs[index], &incoming)? {
@@ -1416,7 +1657,7 @@ impl StylePackStore {
         } else {
             packs.push(incoming.clone());
         }
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         Ok(incoming)
     }
 
@@ -1428,6 +1669,8 @@ impl StylePackStore {
         origin_pack_id: Option<String>,
         origin_author_login: Option<String>,
     ) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let mut packs = self.state.lock();
         let index = packs
             .iter()
@@ -1437,11 +1680,13 @@ impl StylePackStore {
         packs[index].origin_author_login = normalize_optional_text(origin_author_login);
         packs[index].updated_at = Some(Utc::now().to_rfc3339());
         let updated = packs[index].clone();
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         Ok(updated)
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let mut packs = self.state.lock();
         let index = packs
             .iter()
@@ -1453,7 +1698,7 @@ impl StylePackStore {
             packs[index].updated_at = Some(Utc::now().to_rfc3339());
         }
         let updated = packs[index].clone();
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         log::info!(
             "[style-pack] set_enabled id={} enabled={} base_mode={:?}",
             updated.id,
@@ -1464,6 +1709,8 @@ impl StylePackStore {
     }
 
     pub fn reset_builtin(&self, id: &str) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
         let mode = builtin_mode_from_style_pack_id(id)
             .ok_or_else(|| anyhow!("style pack {} is not a builtin pack", id))?;
         let mut packs = self.state.lock();
@@ -1479,7 +1726,7 @@ impl StylePackStore {
             .or_else(|| Some(Utc::now().to_rfc3339()));
         reset.updated_at = Some(Utc::now().to_rfc3339());
         packs[index] = reset.clone();
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         log::info!(
             "[style-pack] reset_builtin id={} base_mode={:?} prompt_chars={} examples={}",
             reset.id,
@@ -1491,6 +1738,9 @@ impl StylePackStore {
     }
 
     pub fn remove_imported(&self, id: &str) -> Result<()> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
+        let asset_root = self.current_asset_root()?;
         let mut packs = self.state.lock();
         let index = packs
             .iter()
@@ -1500,12 +1750,12 @@ impl StylePackStore {
             return Err(anyhow!("builtin style pack cannot be deleted"));
         }
         let removed = packs[index].clone();
-        remove_style_pack_assets(&self.asset_root, &packs[index]);
+        remove_style_pack_assets(&asset_root, &packs[index]);
         packs.remove(index);
         if ensure_at_least_one_style_pack_enabled(&mut packs) {
             // write updated fallback state as well
         }
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         log::info!(
             "[style-pack] removed imported id={} base_mode={:?}",
             removed.id,
@@ -1515,6 +1765,9 @@ impl StylePackStore {
     }
 
     pub fn import_from_zip(&self, zip_path: &Path) -> Result<StylePack> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
+        let asset_root = self.current_asset_root()?;
         let file = fs::File::open(zip_path)
             .with_context(|| format!("open style pack zip failed: {}", zip_path.display()))?;
         let mut archive = zip::ZipArchive::new(file).context("open style pack zip archive")?;
@@ -1528,7 +1781,7 @@ impl StylePackStore {
         let now = Utc::now().to_rfc3339();
         let pack_id = unique_imported_style_pack_id(&packs, &manifest.id);
         let icon_path = if let Some(icon_file) = manifest.icon_file.as_deref() {
-            extract_style_pack_icon(&mut archive, &self.asset_root, &pack_id, icon_file)?
+            extract_style_pack_icon(&mut archive, &asset_root, &pack_id, icon_file)?
         } else {
             None
         };
@@ -1560,7 +1813,7 @@ impl StylePackStore {
             origin_author_login: normalize_optional_text(manifest.origin_author_login),
         };
         packs.insert(0, pack.clone());
-        write_style_packs_file(&self.path, &packs)?;
+        write_style_packs_file(&path, &packs)?;
         log::info!(
             "[style-pack] imported source={} installed_id={} manifest_id={} base_mode={:?} prompt_chars={} examples={} tags={} icon={}",
             zip_path.display(),
@@ -1659,6 +1912,106 @@ impl StylePackStore {
         );
         Ok(())
     }
+
+    pub fn reset_current_profile(&self, prefs: &PreferencesStore) -> Result<()> {
+        self.ensure_current_profile_loaded()?;
+        let path = self.current_path()?;
+        let asset_root = self.current_asset_root()?;
+        let _ = fs::remove_dir_all(&asset_root);
+        ensure_dir(&asset_root)?;
+        let mut packs = Vec::new();
+        let mut prefs_snapshot = prefs.reset_current_profile()?;
+        let mut changed = migrate_style_packs_from_preferences(&mut packs, &prefs_snapshot);
+        if ensure_at_least_one_style_pack_enabled(&mut packs) {
+            changed = true;
+        }
+        if sync_style_pack_preferences(&mut prefs_snapshot, &packs) {
+            prefs.set(prefs_snapshot)?;
+        }
+        if changed {
+            write_style_packs_file(&path, &packs)?;
+        }
+        *self.state.lock() = packs;
+        Ok(())
+    }
+
+    fn current_path(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_file(STYLE_PACKS_FILE)
+        } else {
+            Ok(self.path.clone())
+        }
+    }
+
+    fn current_asset_root(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_assets_dir(STYLE_PACK_ASSETS_DIR)
+        } else {
+            ensure_dir(&self.asset_root)?;
+            Ok(self.asset_root.clone())
+        }
+    }
+
+    fn ensure_current_profile_loaded(&self) -> Result<()> {
+        if !self.profiled {
+            return Ok(());
+        }
+        let active_profile = active_sync_profile_id()?;
+        let mut profile_guard = self.profile_id.lock();
+        if *profile_guard == active_profile {
+            return Ok(());
+        }
+        let path = sync_profile_file(STYLE_PACKS_FILE)?;
+        let packs = load_style_packs_for_profile(&path, None)?;
+        *self.state.lock() = packs;
+        *profile_guard = active_profile;
+        Ok(())
+    }
+}
+
+fn load_style_packs_for_profile(
+    path: &Path,
+    prefs: Option<&PreferencesStore>,
+) -> Result<Vec<StylePack>> {
+    let mut packs = if path.exists() {
+        read_or_default::<Vec<StylePack>>(path).unwrap_or_else(|error| {
+            log::warn!(
+                "[style-packs] load {} failed, using builtin defaults: {}",
+                path.display(),
+                error
+            );
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    let mut prefs_snapshot = prefs
+        .map(PreferencesStore::get)
+        .unwrap_or_else(UserPreferences::default);
+    let mut changed = migrate_style_packs_from_preferences(&mut packs, &prefs_snapshot);
+    if ensure_at_least_one_style_pack_enabled(&mut packs) {
+        changed = true;
+    }
+    let active_pref_for_log = prefs_snapshot.active_style_pack_id.clone();
+    let enabled_modes_for_log = prefs_snapshot.enabled_modes.clone();
+    if let Some(prefs) = prefs {
+        if sync_style_pack_preferences(&mut prefs_snapshot, &packs) {
+            prefs.set(prefs_snapshot)?;
+        }
+    }
+    if changed {
+        write_style_packs_file(path, &packs)?;
+    }
+    log::info!(
+        "[style-pack] store ready: file={} packs={} changed={} active_pref={} enabled_modes={:?}",
+        path.display(),
+        packs.len(),
+        changed,
+        active_pref_for_log,
+        enabled_modes_for_log
+    );
+    Ok(packs)
 }
 
 fn write_style_packs_file(path: &Path, packs: &[StylePack]) -> Result<()> {
@@ -2120,15 +2473,15 @@ fn remove_style_pack_assets(asset_root: &Path, pack: &StylePack) {
 
 pub struct DictionaryStore {
     path: PathBuf,
+    profiled: bool,
     lock: Mutex<()>,
 }
 
 impl DictionaryStore {
     pub fn new() -> Result<Self> {
-        let dir = data_dir()?;
-        ensure_dir(&dir)?;
         Ok(Self {
-            path: dir.join(VOCAB_FILE),
+            path: sync_profile_file(VOCAB_FILE)?,
+            profiled: true,
             lock: Mutex::new(()),
         })
     }
@@ -2182,6 +2535,11 @@ impl DictionaryStore {
             return Ok(());
         }
         self.write_locked(&entries)
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        let _guard = self.lock.lock();
+        self.write_locked(&Vec::<DictionaryEntry>::new())
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
@@ -2240,12 +2598,20 @@ impl DictionaryStore {
     }
 
     fn read_locked(&self) -> Result<Vec<DictionaryEntry>> {
-        read_or_default::<Vec<DictionaryEntry>>(&self.path)
+        read_or_default::<Vec<DictionaryEntry>>(&self.current_path()?)
     }
 
     fn write_locked(&self, entries: &[DictionaryEntry]) -> Result<()> {
         let json = serde_json::to_vec_pretty(entries).context("encode vocab failed")?;
-        atomic_write(&self.path, &json)
+        atomic_write(&self.current_path()?, &json)
+    }
+
+    fn current_path(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_file(VOCAB_FILE)
+        } else {
+            Ok(self.path.clone())
+        }
     }
 }
 
@@ -2275,15 +2641,11 @@ fn count_occurrences(haystack: &str, needle: &str) -> u64 {
 }
 
 pub fn list_vocab_presets() -> Result<VocabPresetStore> {
-    let dir = data_dir()?;
-    ensure_dir(&dir)?;
-    read_or_default::<VocabPresetStore>(&dir.join(VOCAB_PRESETS_FILE))
+    read_or_default::<VocabPresetStore>(&sync_profile_file(VOCAB_PRESETS_FILE)?)
 }
 
 pub fn save_vocab_presets(store: &VocabPresetStore) -> Result<()> {
-    let dir = data_dir()?;
-    ensure_dir(&dir)?;
-    let path = dir.join(VOCAB_PRESETS_FILE);
+    let path = sync_profile_file(VOCAB_PRESETS_FILE)?;
     let json = serde_json::to_vec_pretty(store).context("encode vocab presets failed")?;
     atomic_write(&path, &json)
 }
@@ -2292,15 +2654,15 @@ pub fn save_vocab_presets(store: &VocabPresetStore) -> Result<()> {
 
 pub struct CorrectionRuleStore {
     path: PathBuf,
+    profiled: bool,
     lock: Mutex<()>,
 }
 
 impl CorrectionRuleStore {
     pub fn new() -> Result<Self> {
-        let dir = data_dir()?;
-        ensure_dir(&dir)?;
         Ok(Self {
-            path: dir.join(CORRECTION_RULES_FILE),
+            path: sync_profile_file(CORRECTION_RULES_FILE)?,
+            profiled: true,
             lock: Mutex::new(()),
         })
     }
@@ -2347,6 +2709,11 @@ impl CorrectionRuleStore {
         self.write_locked(&rules)
     }
 
+    pub fn clear(&self) -> Result<()> {
+        let _guard = self.lock.lock();
+        self.write_locked(&Vec::<CorrectionRule>::new())
+    }
+
     pub fn remove(&self, id: &str) -> Result<()> {
         let _guard = self.lock.lock();
         let mut rules = self.read_locked()?;
@@ -2377,12 +2744,20 @@ impl CorrectionRuleStore {
     }
 
     fn read_locked(&self) -> Result<Vec<CorrectionRule>> {
-        read_or_default::<Vec<CorrectionRule>>(&self.path)
+        read_or_default::<Vec<CorrectionRule>>(&self.current_path()?)
     }
 
     fn write_locked(&self, rules: &[CorrectionRule]) -> Result<()> {
         let json = serde_json::to_vec_pretty(rules).context("encode correction rules failed")?;
-        atomic_write(&self.path, &json)
+        atomic_write(&self.current_path()?, &json)
+    }
+
+    fn current_path(&self) -> Result<PathBuf> {
+        if self.profiled {
+            sync_profile_file(CORRECTION_RULES_FILE)
+        } else {
+            Ok(self.path.clone())
+        }
     }
 }
 
@@ -2561,7 +2936,15 @@ pub struct SyncAuthVault;
 impl SyncAuthVault {
     pub fn get() -> Result<Option<SyncAuthSession>> {
         let _guard = credentials_lock().lock();
-        let Some(value) = get_keyring_password(KEYRING_SYNC_AUTH_ACCOUNT)? else {
+        let account = sync_auth_keyring_account()?;
+        let value = match get_keyring_password(&account)? {
+            Some(value) => Some(value),
+            None if active_sync_profile_id()? == DEFAULT_SYNC_PROFILE_ID => {
+                get_keyring_password(KEYRING_SYNC_AUTH_ACCOUNT)?
+            }
+            None => None,
+        };
+        let Some(value) = value else {
             return Ok(None);
         };
         serde_json::from_str::<SyncAuthSession>(&value)
@@ -2572,25 +2955,35 @@ impl SyncAuthVault {
     pub fn set(session: &SyncAuthSession) -> Result<()> {
         let _guard = credentials_lock().lock();
         let json = serde_json::to_string(session).context("encode sync auth session")?;
-        keyring_entry_for(KEYRING_SYNC_AUTH_ACCOUNT)?
+        let account = sync_auth_keyring_account()?;
+        keyring_entry_for(&account)?
             .set_password(&json)
             .context("write sync auth session")
     }
 
     pub fn clear() -> Result<()> {
         let _guard = credentials_lock().lock();
-        delete_keyring_password(KEYRING_SYNC_AUTH_ACCOUNT);
+        let account = sync_auth_keyring_account()?;
+        delete_keyring_password(&account);
         Ok(())
     }
+}
+
+fn sync_auth_keyring_account() -> Result<String> {
+    Ok(format!(
+        "{KEYRING_SYNC_AUTH_ACCOUNT}.{}",
+        active_sync_profile_id()?
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        chunk_json_payload, list_vocab_presets, read_or_default, read_preferences,
-        save_vocab_presets, sync_style_pack_preferences, validate_correction_rule_syntax,
-        CorrectionRuleStore, DictionaryStore, HistoryStore, StylePackStore,
-        SyncSettingsStore, SyncStateStore, KEYRING_CHUNK_MAX_UTF16_UNITS,
+        activate_sync_profile_for_email, chunk_json_payload, list_vocab_presets, read_or_default,
+        read_preferences, save_vocab_presets, sync_style_pack_preferences,
+        validate_correction_rule_syntax, CorrectionRuleStore, DictionaryStore, HistoryStore,
+        PreferencesStore, StylePackStore, SyncSettingsStore, SyncStateStore,
+        DEFAULT_SYNC_PROFILE_ID, KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
     use crate::types::{
         builtin_style_packs, CustomStylePrompts, DictationSession, InsertStatus, PendingSyncChange,
@@ -2600,6 +2993,9 @@ mod tests {
     use parking_lot::Mutex;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn credential_payload_chunks_stay_under_windows_blob_limit() {
@@ -2728,8 +3124,8 @@ mod tests {
 
     #[test]
     fn sync_regression_survives_restart_for_style_pack_history_vocab_and_queue() {
-        let tmp: PathBuf = std::env::temp_dir()
-            .join(format!("openless-sync-regression-{}", uuid::Uuid::new_v4()));
+        let tmp: PathBuf =
+            std::env::temp_dir().join(format!("openless-sync-regression-{}", uuid::Uuid::new_v4()));
         let assets = tmp.join("assets");
         fs::create_dir_all(&assets).expect("create temp dir");
 
@@ -2743,6 +3139,8 @@ mod tests {
         let style_store = StylePackStore {
             path: style_path.clone(),
             asset_root: assets.clone(),
+            profile_id: Mutex::new(DEFAULT_SYNC_PROFILE_ID.to_string()),
+            profiled: false,
             state: Mutex::new(Vec::new()),
         };
         style_store
@@ -2766,6 +3164,7 @@ mod tests {
 
         let history_store = HistoryStore {
             path: history_path.clone(),
+            profiled: false,
             lock: Mutex::new(()),
         };
         history_store
@@ -2794,6 +3193,7 @@ mod tests {
 
         let vocab_store = DictionaryStore {
             path: vocab_path.clone(),
+            profiled: false,
             lock: Mutex::new(()),
         };
         let vocab_entry = vocab_store
@@ -2808,6 +3208,7 @@ mod tests {
 
         let correction_store = CorrectionRuleStore {
             path: correction_path.clone(),
+            profiled: false,
             lock: Mutex::new(()),
         };
         correction_store
@@ -2826,7 +3227,10 @@ mod tests {
 
         let sync_state_store = SyncStateStore::new_for_path(sync_state_path.clone());
         sync_state_store
-            .update_cursor(Some("cursor-42".into()), Some("2026-05-21T00:00:03Z".into()))
+            .update_cursor(
+                Some("cursor-42".into()),
+                Some("2026-05-21T00:00:03Z".into()),
+            )
             .expect("update cursor");
         sync_state_store
             .enqueue(PendingSyncChange {
@@ -2865,20 +3269,25 @@ mod tests {
         let reloaded_style_store = StylePackStore {
             path: style_path.clone(),
             asset_root: assets,
+            profile_id: Mutex::new(DEFAULT_SYNC_PROFILE_ID.to_string()),
+            profiled: false,
             state: Mutex::new(
                 read_or_default::<Vec<StylePack>>(&style_path).expect("reload style packs"),
             ),
         };
         let reloaded_history_store = HistoryStore {
             path: history_path,
+            profiled: false,
             lock: Mutex::new(()),
         };
         let reloaded_vocab_store = DictionaryStore {
             path: vocab_path,
+            profiled: false,
             lock: Mutex::new(()),
         };
         let reloaded_correction_store = CorrectionRuleStore {
             path: correction_path,
+            profiled: false,
             lock: Mutex::new(()),
         };
         let reloaded_sync_settings = SyncSettingsStore::new_for_path(sync_settings_path);
@@ -2888,12 +3297,16 @@ mod tests {
         assert_eq!(packs.len(), 2);
         assert!(packs
             .iter()
-            .any(|pack| pack.id == "local-a" && pack.origin_pack_id.as_deref() == Some("market-pack-1")));
+            .any(|pack| pack.id == "local-a"
+                && pack.origin_pack_id.as_deref() == Some("market-pack-1")));
         assert!(packs
             .iter()
-            .any(|pack| pack.id == "local-b" && pack.origin_pack_id.as_deref() == Some("market-pack-1")));
+            .any(|pack| pack.id == "local-b"
+                && pack.origin_pack_id.as_deref() == Some("market-pack-1")));
 
-        let sessions = reloaded_history_store.list().expect("list reloaded history");
+        let sessions = reloaded_history_store
+            .list()
+            .expect("list reloaded history");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "history-1");
         assert_eq!(sessions[0].style_pack_id.as_deref(), Some("local-a"));
@@ -2905,7 +3318,9 @@ mod tests {
         assert_eq!(vocab[0].hits, 2);
         assert!(!vocab[0].enabled);
 
-        let rules = reloaded_correction_store.list().expect("list reloaded rules");
+        let rules = reloaded_correction_store
+            .list()
+            .expect("list reloaded rules");
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].pattern, "PR");
 
@@ -2920,17 +3335,223 @@ mod tests {
         assert!(state
             .pending_changes
             .iter()
-            .any(|change| change.entity == SyncEntityKind::StylePack && change.entity_id == "local-a"));
+            .any(|change| change.entity == SyncEntityKind::StylePack
+                && change.entity_id == "local-a"));
         assert!(state
             .pending_changes
             .iter()
-            .any(|change| change.entity == SyncEntityKind::HistoryItem && change.entity_id == "history-1"));
+            .any(|change| change.entity == SyncEntityKind::HistoryItem
+                && change.entity_id == "history-1"));
         assert!(state
             .pending_changes
             .iter()
-            .any(|change| change.entity == SyncEntityKind::DictionaryEntry && change.entity_id == vocab_entry.id));
+            .any(|change| change.entity == SyncEntityKind::DictionaryEntry
+                && change.entity_id == vocab_entry.id));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sync_profiles_isolate_local_data_and_queue() {
+        let _guard = TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let tmp: PathBuf =
+            std::env::temp_dir().join(format!("openless-sync-profiles-{}", uuid::Uuid::new_v4()));
+        let home = tmp.join("home");
+        let xdg = tmp.join("xdg");
+        fs::create_dir_all(&home).expect("create temp home");
+        fs::create_dir_all(&xdg).expect("create temp xdg");
+
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_DATA_HOME", &xdg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            activate_sync_profile_for_email("a@example.com").expect("activate account a");
+            let prefs = PreferencesStore::new().expect("prefs store");
+            let style_packs = StylePackStore::new(&prefs).expect("style store");
+            let history = HistoryStore::new().expect("history store");
+            let dictionary = DictionaryStore::new().expect("dictionary store");
+            let correction_rules = CorrectionRuleStore::new().expect("correction store");
+            let sync_settings = SyncSettingsStore::new().expect("sync settings store");
+            let sync_state = SyncStateStore::new().expect("sync state store");
+
+            let mut a_prefs = prefs.get();
+            a_prefs.active_style_pack_id = "a-pack".into();
+            prefs.set(a_prefs).expect("save account a prefs");
+            style_packs
+                .apply_synced_style_pack(synced_style_pack(
+                    "a-pack",
+                    "Account A pack",
+                    "2026-05-21T00:00:01Z",
+                    None,
+                    None,
+                ))
+                .expect("save account a style pack");
+            history
+                .apply_synced_history(DictationSession {
+                    id: "a-history".into(),
+                    created_at: "2026-05-21T00:00:00Z".into(),
+                    raw_transcript: "raw a".into(),
+                    final_text: "final a".into(),
+                    mode: PolishMode::Light,
+                    app_bundle_id: None,
+                    app_name: None,
+                    insert_status: InsertStatus::Inserted,
+                    error_code: None,
+                    duration_ms: None,
+                    dictionary_entry_count: None,
+                    style_pack_id: Some("a-pack".into()),
+                    style_pack_name: Some("Account A pack".into()),
+                    style_pack_prompt_snapshot: Some("prompt a".into()),
+                    device_id: Some("device-a".into()),
+                    updated_at: Some("2026-05-21T00:00:01Z".into()),
+                    deleted_at: None,
+                    sync_version: Some(1),
+                    has_audio_recording: Some(false),
+                })
+                .expect("save account a history");
+            let a_entry = dictionary
+                .add("Account A Term".into(), None)
+                .expect("save account a dictionary");
+            correction_rules
+                .add("AAA".into(), "Account A".into())
+                .expect("save account a rule");
+            save_vocab_presets(&VocabPresetStore {
+                custom: vec![VocabPreset {
+                    id: "a-preset".into(),
+                    name: "Account A preset".into(),
+                    phrases: vec!["A".into()],
+                    created_at: None,
+                    updated_at: None,
+                    deleted_at: None,
+                    device_id: None,
+                    sync_version: None,
+                }],
+                overrides: vec![],
+                disabled_builtin_preset_ids: vec![],
+            })
+            .expect("save account a presets");
+            sync_settings
+                .set(SyncSettings {
+                    enabled: true,
+                    server_url: "https://sync.example.com".into(),
+                    account_email: Some("a@example.com".into()),
+                    device_name: "Mac A".into(),
+                })
+                .expect("save account a settings");
+            let a_device_id = sync_state.get().device_id;
+            sync_state
+                .update_cursor(Some("cursor-a".into()), Some("2026-05-21T00:00:02Z".into()))
+                .expect("save account a cursor");
+            sync_state
+                .enqueue(PendingSyncChange {
+                    id: "queue-a".into(),
+                    entity: SyncEntityKind::DictionaryEntry,
+                    entity_id: a_entry.id.clone(),
+                    operation: SyncChangeOperation::Upsert,
+                    queued_at: "2026-05-21T00:00:03Z".into(),
+                    attempts: 0,
+                    last_error: None,
+                })
+                .expect("save account a queue");
+
+            activate_sync_profile_for_email("b@example.com").expect("activate account b");
+            assert_ne!(prefs.get().active_style_pack_id, "a-pack");
+            assert!(!style_packs
+                .list()
+                .expect("list account b style packs")
+                .iter()
+                .any(|pack| pack.id == "a-pack"));
+            assert!(history.list().expect("list account b history").is_empty());
+            assert!(dictionary
+                .list()
+                .expect("list account b dictionary")
+                .is_empty());
+            assert!(correction_rules
+                .list()
+                .expect("list account b rules")
+                .is_empty());
+            assert!(list_vocab_presets()
+                .expect("list account b presets")
+                .custom
+                .is_empty());
+            assert_ne!(
+                sync_settings.get().account_email.as_deref(),
+                Some("a@example.com")
+            );
+            let b_state = sync_state.get();
+            assert_ne!(b_state.device_id, a_device_id);
+            assert!(b_state.cursor.is_none());
+            assert!(b_state.pending_changes.is_empty());
+
+            activate_sync_profile_for_email("a@example.com").expect("reactivate account a");
+            assert_eq!(prefs.get().active_style_pack_id, "a-pack");
+            assert!(style_packs
+                .list()
+                .expect("list account a style packs")
+                .iter()
+                .any(|pack| pack.id == "a-pack"));
+            assert_eq!(
+                history
+                    .list()
+                    .expect("list account a history")
+                    .first()
+                    .map(|item| item.id.as_str()),
+                Some("a-history")
+            );
+            assert_eq!(
+                dictionary
+                    .list()
+                    .expect("list account a dictionary")
+                    .first()
+                    .map(|item| item.phrase.as_str()),
+                Some("Account A Term")
+            );
+            assert_eq!(
+                correction_rules
+                    .list()
+                    .expect("list account a rules")
+                    .first()
+                    .map(|item| item.pattern.as_str()),
+                Some("AAA")
+            );
+            assert_eq!(
+                list_vocab_presets()
+                    .expect("list account a presets")
+                    .custom
+                    .first()
+                    .map(|item| item.id.as_str()),
+                Some("a-preset")
+            );
+            assert_eq!(
+                sync_settings.get().account_email.as_deref(),
+                Some("a@example.com")
+            );
+            let restored_a_state = sync_state.get();
+            assert_eq!(restored_a_state.device_id, a_device_id);
+            assert_eq!(restored_a_state.cursor.as_deref(), Some("cursor-a"));
+            assert_eq!(restored_a_state.pending_changes.len(), 1);
+        });
+
+        unsafe {
+            if let Some(value) = old_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[test]
@@ -3057,6 +3678,8 @@ mod tests {
         let store = StylePackStore {
             path: tmp.join("style-packs.json"),
             asset_root: tmp.join("assets"),
+            profile_id: Mutex::new(DEFAULT_SYNC_PROFILE_ID.to_string()),
+            profiled: false,
             state: Mutex::new(Vec::new()),
         };
         (tmp, store)

@@ -226,6 +226,7 @@ pub struct SyncAuthSession {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub access_token_expires_at: Option<String>,
+    pub refresh_token_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

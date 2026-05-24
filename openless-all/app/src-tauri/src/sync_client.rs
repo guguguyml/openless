@@ -22,7 +22,11 @@ pub struct SyncApiError {
 }
 
 impl SyncApiError {
-    pub(crate) fn local(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
+    pub(crate) fn local(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -63,7 +67,10 @@ pub struct SyncApiClient {
 }
 
 impl SyncApiClient {
-    pub fn new(base_url: impl AsRef<str>, access_token: Option<String>) -> Result<Self, SyncApiError> {
+    pub fn new(
+        base_url: impl AsRef<str>,
+        access_token: Option<String>,
+    ) -> Result<Self, SyncApiError> {
         let base_url = normalize_base_url(base_url.as_ref())?;
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
@@ -123,6 +130,19 @@ impl SyncApiClient {
         .await
     }
 
+    pub async fn refresh_token(
+        &self,
+        refresh_token: String,
+    ) -> Result<SyncTokenRefreshResult, SyncApiError> {
+        self.send_json(
+            Method::POST,
+            "/auth/token/refresh",
+            Some(json!({ "refresh_token": refresh_token })),
+            false,
+        )
+        .await
+    }
+
     pub async fn pull(&self, cursor: Option<&str>) -> Result<SyncPullResult, SyncApiError> {
         let cursor = cursor.unwrap_or("").trim();
         let path = if cursor.is_empty() {
@@ -163,12 +183,19 @@ impl SyncApiClient {
         })
     }
 
-    pub async fn logout_device(&self, device_id: String) -> Result<SyncOkResult, SyncApiError> {
+    pub async fn logout_device(
+        &self,
+        device_id: String,
+        refresh_token: String,
+    ) -> Result<SyncOkResult, SyncApiError> {
         self.send_json(
             Method::POST,
             "/sync/logout-device",
-            Some(json!({ "device_id": device_id })),
-            true,
+            Some(json!({
+                "device_id": device_id,
+                "refresh_token": refresh_token,
+            })),
+            false,
         )
         .await
     }
@@ -266,6 +293,24 @@ pub struct SyncEmailCodeVerifyResult {
     pub access_token: String,
     #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
+    #[serde(default, alias = "access_token_expires_at")]
+    pub access_token_expires_at: Option<String>,
+    #[serde(default, alias = "refresh_token_expires_at")]
+    pub refresh_token_expires_at: Option<String>,
+    pub user: SyncUserInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncTokenRefreshResult {
+    #[serde(alias = "access_token")]
+    pub access_token: String,
+    #[serde(alias = "refresh_token")]
+    pub refresh_token: Option<String>,
+    #[serde(default, alias = "access_token_expires_at")]
+    pub access_token_expires_at: Option<String>,
+    #[serde(default, alias = "refresh_token_expires_at")]
+    pub refresh_token_expires_at: Option<String>,
     pub user: SyncUserInfo,
 }
 
@@ -506,15 +551,16 @@ mod tests {
                     r#"{"cursor":"8","server_time":"2026-05-20T00:00:00Z","prompts":[{"id":"pack-1","baseMode":"light"}],"provider_configs":[],"history_items":[],"dictionary_entries":[],"correction_rules":[],"vocab_presets":[]}"#,
                 ),
                 (
+                    "POST /auth/token/refresh HTTP/1.1",
+                    None,
+                    r#"{"access_token":"tok-2","refresh_token":"ref-2","access_token_expires_at":"2026-05-20T01:00:00Z","refresh_token_expires_at":"2026-06-20T00:00:00Z","user":{"id":"user-1","email":"u@example.com"}}"#,
+                ),
+                (
                     "POST /sync/push HTTP/1.1",
                     Some("Authorization: Bearer tok"),
                     r#"{"ok":true,"cursor":"9","conflicts_resolved":0}"#,
                 ),
-                (
-                    "POST /sync/logout-device HTTP/1.1",
-                    Some("Authorization: Bearer tok"),
-                    r#"{"ok":true}"#,
-                ),
+                ("POST /sync/logout-device HTTP/1.1", None, r#"{"ok":true}"#),
                 (
                     "DELETE /account/data HTTP/1.1",
                     Some("Authorization: Bearer tok"),
@@ -572,6 +618,10 @@ mod tests {
         assert_eq!(pulled.cursor, "8");
         assert_eq!(pulled.prompts[0]["baseMode"], "light");
 
+        let refreshed = public_client.refresh_token("ref".into()).await.unwrap();
+        assert_eq!(refreshed.access_token, "tok-2");
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("ref-2"));
+
         let pushed = authed_client
             .push(
                 "device-1".into(),
@@ -584,7 +634,13 @@ mod tests {
             .unwrap();
         assert_eq!(pushed.cursor, "9");
 
-        assert!(authed_client.logout_device("device-1".into()).await.unwrap().ok);
+        assert!(
+            public_client
+                .logout_device("device-1".into(), "ref-2".into())
+                .await
+                .unwrap()
+                .ok
+        );
         assert!(authed_client.clear_cloud_data().await.unwrap().ok);
         server.join().unwrap();
     }
@@ -597,7 +653,8 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _ = read_request(&mut stream);
-            let body = r#"{"error":{"code":"rate_limited","message":"too many email code requests"}}"#;
+            let body =
+                r#"{"error":{"code":"rate_limited","message":"too many email code requests"}}"#;
             let response = format!(
                 "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),

@@ -811,6 +811,7 @@ export function syncVerifyEmailCode(email: string, code: string): Promise<SyncLo
       accessToken: 'mock-sync-token',
       refreshToken: 'mock-sync-refresh-token',
       accessTokenExpiresAt: null,
+      refreshTokenExpiresAt: null,
     };
     mockSyncSettings = {
       ...mockSyncSettings,
@@ -894,6 +895,27 @@ export function syncClearCloudData(): Promise<SyncClearCloudDataResult> {
       lastError: null,
     };
     return { ok: true, deletedAt: now };
+  });
+}
+
+export function syncClearLocalProfileData(): Promise<SyncOkResult> {
+  return invokeOrMock('sync_clear_local_profile_data', undefined, () => {
+    mockSyncAuthSession = null;
+    mockSyncSettings = {
+      ...mockSyncSettings,
+      enabled: false,
+      accountEmail: null,
+    };
+    mockSyncState = {
+      ...mockSyncState,
+      cursor: null,
+      lastSyncAt: null,
+      lastPushAt: null,
+      lastPullAt: null,
+      lastError: null,
+      pendingChanges: [],
+    };
+    return { ok: true };
   });
 }
 
