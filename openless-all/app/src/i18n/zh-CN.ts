@@ -556,6 +556,7 @@ export const zhCN = {
       clearLocalConfirm: '这会清空当前账号在本机的历史、词汇、风格包、纠正规则和同步状态，云端数据会保留。继续吗？',
       clearLocalConfirmSecond: '清空后需要重新登录同步账号，确定继续吗？',
       clearLocalSuccess: '已清空本机当前账号数据。',
+      bindAnonymousConfirm: '检测到本机匿名数据。要把这些数据绑定到 {{email}} 吗？',
       advancedTitle: '高级设置',
       advancedDesc: '自定义同步服务器与后续迁移入口。',
       serverUrlLabel: '同步服务地址',

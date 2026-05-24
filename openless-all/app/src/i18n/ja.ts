@@ -560,6 +560,7 @@ export const ja: typeof zhCN = {
       clearLocalConfirm: 'このアカウントのローカル履歴、語彙、スタイルパック、修正ルール、同期状態を消去します。クラウドデータは残ります。続行しますか？',
       clearLocalConfirmSecond: '消去後は同期アカウントへの再ログインが必要です。続行しますか？',
       clearLocalSuccess: 'このアカウントのローカルデータを消去しました。',
+      bindAnonymousConfirm: 'この端末に匿名データがあります。{{email}} に紐づけますか？',
       advancedTitle: '詳細設定',
       advancedDesc: '同期サーバーの指定と移行機能の入口。',
       serverUrlLabel: '同期サーバー URL',

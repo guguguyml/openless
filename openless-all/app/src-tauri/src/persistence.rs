@@ -11,6 +11,7 @@
 //! A legacy plaintext JSON file is read once as a migration source and removed
 //! after a successful vault write; new writes never persist plaintext secrets.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,8 +28,8 @@ use crate::types::{
     builtin_style_pack_for_mode, builtin_style_pack_id, builtin_style_packs,
     default_active_style_pack_id, CorrectionRule, CustomStylePrompts, DictationSession,
     DictionaryEntry, PendingSyncChange, PolishMode, StylePack, StylePackExample, StylePackKind,
-    SyncAuthSession, SyncSettings, SyncState, UserPreferences, VocabPresetStore,
-    BUILTIN_STYLE_PACK_LIGHT_ID,
+    SyncAuthSession, SyncChangeOperation, SyncEntityKind, SyncSettings, SyncState,
+    UserPreferences, VocabPreset, VocabPresetStore, BUILTIN_STYLE_PACK_LIGHT_ID,
 };
 
 const HISTORY_CAP: usize = 200;
@@ -215,14 +216,22 @@ fn migrate_legacy_sync_profile_file(file_name: &str, profile_path: &Path) -> Res
 
 pub fn activate_sync_profile_for_email(email: &str) -> Result<String> {
     let profile_id = sync_profile_id_for_email(email);
+    activate_sync_profile_id(&profile_id)
+}
+
+pub fn activate_default_sync_profile() -> Result<String> {
+    activate_sync_profile_id(DEFAULT_SYNC_PROFILE_ID)
+}
+
+fn activate_sync_profile_id(profile_id: &str) -> Result<String> {
     let path = sync_profile_state_path()?;
     let state = SyncProfileState {
-        active_profile_id: profile_id.clone(),
+        active_profile_id: profile_id.to_string(),
     };
     let json = serde_json::to_vec_pretty(&state).context("encode sync profile state failed")?;
     atomic_write(&path, &json)?;
-    let _ = sync_profile_dir(&profile_id)?;
-    Ok(profile_id)
+    let _ = sync_profile_dir(profile_id)?;
+    Ok(profile_id.to_string())
 }
 
 fn sync_profile_id_for_email(email: &str) -> String {
@@ -236,6 +245,357 @@ fn sync_profile_id_for_email(email: &str) -> String {
         hex.push_str(&format!("{byte:02x}"));
     }
     format!("account-{hex}")
+}
+
+fn sync_profile_file_for_id(profile_id: &str, file_name: &str) -> Result<PathBuf> {
+    Ok(sync_profile_dir(profile_id)?.join(file_name))
+}
+
+pub fn anonymous_profile_has_user_data() -> Result<bool> {
+    sync_profile_has_user_data(DEFAULT_SYNC_PROFILE_ID)
+}
+
+fn sync_profile_has_user_data(profile_id: &str) -> Result<bool> {
+    let history = read_or_default::<Vec<DictationSession>>(&sync_profile_file_for_id(
+        profile_id,
+        HISTORY_FILE,
+    )?)?;
+    if history.iter().any(|item| item.deleted_at.is_none()) {
+        return Ok(true);
+    }
+
+    let style_packs = read_or_default::<Vec<StylePack>>(&sync_profile_file_for_id(
+        profile_id,
+        STYLE_PACKS_FILE,
+    )?)?;
+    if style_packs
+        .iter()
+        .any(|pack| pack.kind != StylePackKind::Builtin)
+    {
+        return Ok(true);
+    }
+
+    let vocab =
+        read_or_default::<Vec<DictionaryEntry>>(&sync_profile_file_for_id(profile_id, VOCAB_FILE)?)?;
+    if vocab.iter().any(|entry| entry.deleted_at.is_none()) {
+        return Ok(true);
+    }
+
+    let rules = read_or_default::<Vec<CorrectionRule>>(&sync_profile_file_for_id(
+        profile_id,
+        CORRECTION_RULES_FILE,
+    )?)?;
+    if rules.iter().any(|rule| rule.deleted_at.is_none()) {
+        return Ok(true);
+    }
+
+    let presets = read_or_default::<VocabPresetStore>(&sync_profile_file_for_id(
+        profile_id,
+        VOCAB_PRESETS_FILE,
+    )?)?;
+    if !presets.custom.is_empty()
+        || !presets.overrides.is_empty()
+        || !presets.disabled_builtin_preset_ids.is_empty()
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+pub fn bind_anonymous_profile_to_email(email: &str) -> Result<()> {
+    let account_profile_id = sync_profile_id_for_email(email);
+    if account_profile_id == DEFAULT_SYNC_PROFILE_ID {
+        return Ok(());
+    }
+
+    merge_history_profiles(DEFAULT_SYNC_PROFILE_ID, &account_profile_id)?;
+    merge_style_pack_profiles(DEFAULT_SYNC_PROFILE_ID, &account_profile_id)?;
+    merge_dictionary_profiles(DEFAULT_SYNC_PROFILE_ID, &account_profile_id)?;
+    merge_correction_rule_profiles(DEFAULT_SYNC_PROFILE_ID, &account_profile_id)?;
+    merge_vocab_preset_profiles(DEFAULT_SYNC_PROFILE_ID, &account_profile_id)?;
+    merge_profile_style_preferences(DEFAULT_SYNC_PROFILE_ID, &account_profile_id)?;
+    merge_profile_sync_state(DEFAULT_SYNC_PROFILE_ID, &account_profile_id)?;
+    enqueue_profile_data_for_sync(&account_profile_id)?;
+    clear_profile_business_data(DEFAULT_SYNC_PROFILE_ID)?;
+    Ok(())
+}
+
+fn merge_history_profiles(from_profile_id: &str, to_profile_id: &str) -> Result<()> {
+    let from_path = sync_profile_file_for_id(from_profile_id, HISTORY_FILE)?;
+    let to_path = sync_profile_file_for_id(to_profile_id, HISTORY_FILE)?;
+    let incoming = read_or_default::<Vec<DictationSession>>(&from_path)?;
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    let mut target = read_or_default::<Vec<DictationSession>>(&to_path)?;
+    for session in incoming {
+        if let Some(existing) = target.iter_mut().find(|item| item.id == session.id) {
+            if history_updated_at(&session) >= history_updated_at(existing) {
+                *existing = session;
+            }
+        } else {
+            target.push(session);
+        }
+    }
+    target.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    if target.len() > HISTORY_CAP {
+        target.truncate(HISTORY_CAP);
+    }
+    write_json(&to_path, &target)
+}
+
+fn merge_style_pack_profiles(from_profile_id: &str, to_profile_id: &str) -> Result<()> {
+    let from_path = sync_profile_file_for_id(from_profile_id, STYLE_PACKS_FILE)?;
+    let to_path = sync_profile_file_for_id(to_profile_id, STYLE_PACKS_FILE)?;
+    let incoming = read_or_default::<Vec<StylePack>>(&from_path)?;
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    let mut target = read_or_default::<Vec<StylePack>>(&to_path)?;
+    for pack in incoming {
+        if let Some(existing) = target.iter_mut().find(|item| item.id == pack.id) {
+            if style_pack_timestamp(&pack) >= style_pack_timestamp(existing) {
+                *existing = pack;
+            }
+        } else {
+            target.push(pack);
+        }
+    }
+    write_style_packs_file(&to_path, &target)
+}
+
+fn merge_dictionary_profiles(from_profile_id: &str, to_profile_id: &str) -> Result<()> {
+    let from_path = sync_profile_file_for_id(from_profile_id, VOCAB_FILE)?;
+    let to_path = sync_profile_file_for_id(to_profile_id, VOCAB_FILE)?;
+    let incoming = read_or_default::<Vec<DictionaryEntry>>(&from_path)?;
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    let mut target = read_or_default::<Vec<DictionaryEntry>>(&to_path)?;
+    for entry in incoming {
+        if let Some(existing) = target.iter_mut().find(|item| item.id == entry.id) {
+            if dictionary_updated_at(&entry) >= dictionary_updated_at(existing) {
+                *existing = entry;
+            }
+        } else {
+            target.push(entry);
+        }
+    }
+    target.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    write_json(&to_path, &target)
+}
+
+fn merge_correction_rule_profiles(from_profile_id: &str, to_profile_id: &str) -> Result<()> {
+    let from_path = sync_profile_file_for_id(from_profile_id, CORRECTION_RULES_FILE)?;
+    let to_path = sync_profile_file_for_id(to_profile_id, CORRECTION_RULES_FILE)?;
+    let incoming = read_or_default::<Vec<CorrectionRule>>(&from_path)?;
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    let mut target = read_or_default::<Vec<CorrectionRule>>(&to_path)?;
+    for rule in incoming {
+        if let Some(existing) = target.iter_mut().find(|item| item.id == rule.id) {
+            if correction_rule_updated_at(&rule) >= correction_rule_updated_at(existing) {
+                *existing = rule;
+            }
+        } else {
+            target.push(rule);
+        }
+    }
+    target.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    write_json(&to_path, &target)
+}
+
+fn merge_vocab_preset_profiles(from_profile_id: &str, to_profile_id: &str) -> Result<()> {
+    let from_path = sync_profile_file_for_id(from_profile_id, VOCAB_PRESETS_FILE)?;
+    let to_path = sync_profile_file_for_id(to_profile_id, VOCAB_PRESETS_FILE)?;
+    let incoming = read_or_default::<VocabPresetStore>(&from_path)?;
+    if incoming.custom.is_empty()
+        && incoming.overrides.is_empty()
+        && incoming.disabled_builtin_preset_ids.is_empty()
+    {
+        return Ok(());
+    }
+    let mut target = read_or_default::<VocabPresetStore>(&to_path)?;
+    merge_vocab_preset_list(&mut target.custom, incoming.custom);
+    merge_vocab_preset_list(&mut target.overrides, incoming.overrides);
+    let mut disabled: HashSet<String> = target.disabled_builtin_preset_ids.into_iter().collect();
+    disabled.extend(incoming.disabled_builtin_preset_ids);
+    target.disabled_builtin_preset_ids = disabled.into_iter().collect();
+    target.disabled_builtin_preset_ids.sort();
+    write_json(&to_path, &target)
+}
+
+fn merge_vocab_preset_list(target: &mut Vec<VocabPreset>, incoming: Vec<VocabPreset>) {
+    for preset in incoming {
+        if let Some(existing) = target.iter_mut().find(|item| item.id == preset.id) {
+            if vocab_preset_updated_at(&preset) >= vocab_preset_updated_at(existing) {
+                *existing = preset;
+            }
+        } else {
+            target.push(preset);
+        }
+    }
+}
+
+fn merge_profile_style_preferences(from_profile_id: &str, to_profile_id: &str) -> Result<()> {
+    let from_path = sync_profile_file_for_id(from_profile_id, PREFERENCES_FILE)?;
+    if !from_path.exists() {
+        return Ok(());
+    }
+    let from = read_preferences(&from_path)?;
+    let to_path = sync_profile_file_for_id(to_profile_id, PREFERENCES_FILE)?;
+    let mut to = read_preferences(&to_path).unwrap_or_default();
+    to.default_mode = from.default_mode;
+    to.enabled_modes = from.enabled_modes;
+    to.active_style_pack_id = from.active_style_pack_id;
+    to.style_system_prompts = from.style_system_prompts;
+    to.custom_style_prompts = from.custom_style_prompts;
+    write_json(&to_path, &to)
+}
+
+fn merge_profile_sync_state(from_profile_id: &str, to_profile_id: &str) -> Result<()> {
+    let from_path = sync_profile_file_for_id(from_profile_id, SYNC_STATE_FILE)?;
+    if !from_path.exists() {
+        return Ok(());
+    }
+    let from = read_or_default::<SyncState>(&from_path)?;
+    let to_path = sync_profile_file_for_id(to_profile_id, SYNC_STATE_FILE)?;
+    let mut to = read_or_default::<SyncState>(&to_path)?;
+    if to.cursor.is_none() {
+        to.cursor = from.cursor;
+    }
+    if to.last_sync_at.is_none() {
+        to.last_sync_at = from.last_sync_at;
+    }
+    if to.last_push_at.is_none() {
+        to.last_push_at = from.last_push_at;
+    }
+    if to.last_pull_at.is_none() {
+        to.last_pull_at = from.last_pull_at;
+    }
+    if to.last_error.is_none() {
+        to.last_error = from.last_error;
+    }
+    write_json(&to_path, &to)
+}
+
+fn enqueue_profile_data_for_sync(profile_id: &str) -> Result<()> {
+    let state_path = sync_profile_file_for_id(profile_id, SYNC_STATE_FILE)?;
+    let mut state = read_or_default::<SyncState>(&state_path)?;
+    let now = Utc::now().to_rfc3339();
+
+    let style_packs = read_or_default::<Vec<StylePack>>(&sync_profile_file_for_id(
+        profile_id,
+        STYLE_PACKS_FILE,
+    )?)?;
+    for pack in style_packs
+        .into_iter()
+        .filter(|pack| pack.kind != StylePackKind::Builtin)
+    {
+        push_pending_profile_change(&mut state, SyncEntityKind::StylePack, pack.id, &now);
+    }
+
+    let history = read_or_default::<Vec<DictationSession>>(&sync_profile_file_for_id(
+        profile_id,
+        HISTORY_FILE,
+    )?)?;
+    for item in history {
+        push_pending_profile_change(&mut state, SyncEntityKind::HistoryItem, item.id, &now);
+    }
+
+    let entries =
+        read_or_default::<Vec<DictionaryEntry>>(&sync_profile_file_for_id(profile_id, VOCAB_FILE)?)?;
+    for entry in entries {
+        push_pending_profile_change(&mut state, SyncEntityKind::DictionaryEntry, entry.id, &now);
+    }
+
+    let rules = read_or_default::<Vec<CorrectionRule>>(&sync_profile_file_for_id(
+        profile_id,
+        CORRECTION_RULES_FILE,
+    )?)?;
+    for rule in rules {
+        push_pending_profile_change(&mut state, SyncEntityKind::CorrectionRule, rule.id, &now);
+    }
+
+    let presets = read_or_default::<VocabPresetStore>(&sync_profile_file_for_id(
+        profile_id,
+        VOCAB_PRESETS_FILE,
+    )?)?;
+    for preset in presets.custom.into_iter().chain(presets.overrides.into_iter()) {
+        push_pending_profile_change(&mut state, SyncEntityKind::VocabPreset, preset.id, &now);
+    }
+
+    write_json(&state_path, &state)
+}
+
+fn push_pending_profile_change(
+    state: &mut SyncState,
+    entity: SyncEntityKind,
+    entity_id: String,
+    queued_at: &str,
+) {
+    if state
+        .pending_changes
+        .iter()
+        .any(|change| change.entity == entity && change.entity_id == entity_id)
+    {
+        return;
+    }
+    state.pending_changes.push(PendingSyncChange {
+        id: format!("change-{}", Uuid::new_v4().simple()),
+        entity,
+        entity_id,
+        operation: SyncChangeOperation::Upsert,
+        queued_at: queued_at.to_string(),
+        attempts: 0,
+        last_error: None,
+    });
+}
+
+fn clear_profile_business_data(profile_id: &str) -> Result<()> {
+    for file_name in [
+        HISTORY_FILE,
+        STYLE_PACKS_FILE,
+        VOCAB_FILE,
+        CORRECTION_RULES_FILE,
+        VOCAB_PRESETS_FILE,
+    ] {
+        let path = sync_profile_file_for_id(profile_id, file_name)?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove profile file failed: {}", path.display()))?;
+        }
+    }
+    reset_profile_sync_state(profile_id)?;
+    Ok(())
+}
+
+fn reset_profile_sync_state(profile_id: &str) -> Result<()> {
+    let path = sync_profile_file_for_id(profile_id, SYNC_STATE_FILE)?;
+    let mut state = read_or_default::<SyncState>(&path)?;
+    let device_id = state.device_id.clone();
+    state = SyncState::default();
+    state.device_id = device_id;
+    write_json(&path, &state)
+}
+
+fn style_pack_timestamp(pack: &StylePack) -> &str {
+    pack.updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| pack.created_at.as_deref())
+        .unwrap_or("")
+}
+
+fn vocab_preset_updated_at(preset: &VocabPreset) -> &str {
+    preset
+        .updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| preset.created_at.as_deref())
+        .unwrap_or("")
 }
 
 trait IfEmpty {
@@ -420,6 +780,11 @@ fn read_or_default<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Resul
     }
     serde_json::from_slice::<T>(&bytes)
         .with_context(|| format!("decode failed: {}", path.display()))
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let json = serde_json::to_vec_pretty(value).context("encode json failed")?;
+    atomic_write(path, &json)
 }
 
 fn read_preferences(path: &Path) -> Result<UserPreferences> {
@@ -1259,10 +1624,30 @@ impl PreferencesStore {
         } else {
             UserPreferences::default()
         };
+        let previous = self.state.lock().clone();
+        let mut prefs = prefs;
+        preserve_device_preferences(&previous, &mut prefs);
+        write_json(&path, &prefs)?;
         *self.state.lock() = prefs;
         *profile_guard = active_profile;
         Ok(())
     }
+}
+
+fn preserve_device_preferences(previous: &UserPreferences, next: &mut UserPreferences) {
+    let default_mode = next.default_mode;
+    let enabled_modes = next.enabled_modes.clone();
+    let active_style_pack_id = next.active_style_pack_id.clone();
+    let style_system_prompts = next.style_system_prompts.clone();
+    let custom_style_prompts = next.custom_style_prompts.clone();
+
+    *next = previous.clone();
+
+    next.default_mode = default_mode;
+    next.enabled_modes = enabled_modes;
+    next.active_style_pack_id = active_style_pack_id;
+    next.style_system_prompts = style_system_prompts;
+    next.custom_style_prompts = custom_style_prompts;
 }
 
 // ───────────────────────── Sync local state ─────────────────────────
@@ -2997,11 +3382,12 @@ fn sync_auth_keyring_accounts() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_sync_profile_for_email, chunk_json_payload, list_vocab_presets, read_or_default,
-        read_preferences, save_vocab_presets, sync_auth_keyring_accounts,
-        sync_style_pack_preferences, validate_correction_rule_syntax, CorrectionRuleStore,
-        DictionaryStore, HistoryStore, PreferencesStore, StylePackStore, SyncSettingsStore,
-        SyncStateStore, DEFAULT_SYNC_PROFILE_ID, KEYRING_CHUNK_MAX_UTF16_UNITS,
+        activate_default_sync_profile, activate_sync_profile_for_email,
+        anonymous_profile_has_user_data, bind_anonymous_profile_to_email, chunk_json_payload,
+        list_vocab_presets, read_or_default, read_preferences, save_vocab_presets,
+        sync_auth_keyring_accounts, sync_style_pack_preferences, validate_correction_rule_syntax,
+        CorrectionRuleStore, DictionaryStore, HistoryStore, PreferencesStore, StylePackStore,
+        SyncSettingsStore, SyncStateStore, DEFAULT_SYNC_PROFILE_ID, KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
     use crate::types::{
         builtin_style_packs, CustomStylePrompts, DictationSession, InsertStatus, PendingSyncChange,
@@ -3589,6 +3975,204 @@ mod tests {
             assert_eq!(restored_a_state.device_id, a_device_id);
             assert_eq!(restored_a_state.cursor.as_deref(), Some("cursor-a"));
             assert_eq!(restored_a_state.pending_changes.len(), 1);
+        });
+
+        unsafe {
+            if let Some(value) = old_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn anonymous_profile_binding_moves_business_data_to_account_profile() {
+        let _guard = TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let tmp: PathBuf =
+            std::env::temp_dir().join(format!("openless-anon-bind-{}", uuid::Uuid::new_v4()));
+        let home = tmp.join("home");
+        let xdg = tmp.join("xdg");
+        fs::create_dir_all(&home).expect("create temp home");
+        fs::create_dir_all(&xdg).expect("create temp xdg");
+
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_DATA_HOME", &xdg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            activate_default_sync_profile().expect("activate anonymous profile");
+
+            let prefs = PreferencesStore::new().expect("prefs store");
+            let style_packs = StylePackStore::new(&prefs).expect("style store");
+            let history = HistoryStore::new().expect("history store");
+            let dictionary = DictionaryStore::new().expect("dictionary store");
+            let correction_rules = CorrectionRuleStore::new().expect("correction store");
+            let sync_state = SyncStateStore::new().expect("sync state store");
+
+            let mut anon_prefs = prefs.get();
+            anon_prefs.active_style_pack_id = "anon-pack".into();
+            prefs.set(anon_prefs).expect("save anon prefs");
+            style_packs
+                .apply_synced_style_pack(synced_style_pack(
+                    "anon-pack",
+                    "Anonymous pack",
+                    "2026-05-21T00:00:01Z",
+                    None,
+                    None,
+                ))
+                .expect("save anon style pack");
+            history
+                .apply_synced_history(DictationSession {
+                    id: "anon-history".into(),
+                    created_at: "2026-05-21T00:00:00Z".into(),
+                    raw_transcript: "raw anon".into(),
+                    final_text: "final anon".into(),
+                    mode: PolishMode::Structured,
+                    app_bundle_id: None,
+                    app_name: Some("Notes".into()),
+                    insert_status: InsertStatus::Inserted,
+                    error_code: None,
+                    duration_ms: Some(900),
+                    dictionary_entry_count: Some(1),
+                    style_pack_id: Some("anon-pack".into()),
+                    style_pack_name: Some("Anonymous pack".into()),
+                    style_pack_prompt_snapshot: Some("Rewrite clearly.".into()),
+                    device_id: Some("device-anon".into()),
+                    updated_at: Some("2026-05-21T00:00:01Z".into()),
+                    deleted_at: None,
+                    sync_version: Some(1),
+                    has_audio_recording: Some(false),
+                })
+                .expect("save anon history");
+            dictionary
+                .add("AnonTerm".into(), None)
+                .expect("save anon dictionary");
+            correction_rules
+                .add("AT".into(), "Anon Term".into())
+                .expect("save anon rule");
+            save_vocab_presets(&VocabPresetStore {
+                custom: vec![VocabPreset {
+                    id: "anon-preset".into(),
+                    name: "Anonymous preset".into(),
+                    phrases: vec!["AT".into()],
+                    created_at: None,
+                    updated_at: None,
+                    deleted_at: None,
+                    device_id: None,
+                    sync_version: None,
+                }],
+                overrides: vec![],
+                disabled_builtin_preset_ids: vec![],
+            })
+            .expect("save anon presets");
+            sync_state
+                .update_cursor(Some("cursor-anon".into()), Some("2026-05-21T00:00:02Z".into()))
+                .expect("save anon cursor");
+            sync_state
+                .enqueue(PendingSyncChange {
+                    id: "queue-anon".into(),
+                    entity: SyncEntityKind::HistoryItem,
+                    entity_id: "anon-history".into(),
+                    operation: SyncChangeOperation::Upsert,
+                    queued_at: "2026-05-21T00:00:03Z".into(),
+                    attempts: 0,
+                    last_error: None,
+                })
+                .expect("save anon queue");
+
+            assert!(anonymous_profile_has_user_data().expect("inspect anonymous data"));
+
+            bind_anonymous_profile_to_email("user@example.com").expect("bind anonymous data");
+            assert!(!anonymous_profile_has_user_data().expect("anonymous profile after bind"));
+
+            activate_sync_profile_for_email("user@example.com").expect("activate account profile");
+            let account_prefs = PreferencesStore::new().expect("account prefs");
+            let account_style_packs = StylePackStore::new(&account_prefs).expect("account style store");
+            let account_history = HistoryStore::new().expect("account history store");
+            let account_dictionary = DictionaryStore::new().expect("account dictionary store");
+            let account_correction_rules =
+                CorrectionRuleStore::new().expect("account correction store");
+            let account_sync_state = SyncStateStore::new().expect("account sync state store");
+
+            assert_eq!(account_prefs.get().active_style_pack_id, "anon-pack");
+            assert!(account_style_packs
+                .list()
+                .expect("list account style packs")
+                .iter()
+                .any(|pack| pack.id == "anon-pack"));
+            assert_eq!(
+                account_history
+                    .list()
+                    .expect("list account history")
+                    .first()
+                    .map(|item| item.id.as_str()),
+                Some("anon-history")
+            );
+            assert_eq!(
+                account_dictionary
+                    .list()
+                    .expect("list account dictionary")
+                    .first()
+                    .map(|item| item.phrase.as_str()),
+                Some("AnonTerm")
+            );
+            assert_eq!(
+                account_correction_rules
+                    .list()
+                    .expect("list account rules")
+                    .first()
+                    .map(|item| item.pattern.as_str()),
+                Some("AT")
+            );
+            assert_eq!(
+                list_vocab_presets()
+                    .expect("list account presets")
+                    .custom
+                    .first()
+                    .map(|item| item.id.as_str()),
+                Some("anon-preset")
+            );
+            let account_state = account_sync_state.get();
+            assert_eq!(account_state.cursor.as_deref(), Some("cursor-anon"));
+            assert!(!account_state.pending_changes.is_empty());
+
+            activate_default_sync_profile().expect("reactivate anonymous profile");
+            let anon_prefs = PreferencesStore::new().expect("anon prefs after bind");
+            let anon_style_packs = StylePackStore::new(&anon_prefs).expect("anon style store");
+            let anon_history = HistoryStore::new().expect("anon history store");
+            let anon_dictionary = DictionaryStore::new().expect("anon dictionary store");
+            let anon_correction_rules =
+                CorrectionRuleStore::new().expect("anon correction store");
+            let anon_sync_state = SyncStateStore::new().expect("anon sync state store");
+
+            assert!(!anonymous_profile_has_user_data().expect("anonymous profile after cleanup"));
+            assert!(
+                !anon_style_packs
+                    .list()
+                    .expect("list anon style packs")
+                    .iter()
+                    .any(|pack| pack.id == "anon-pack")
+            );
+            assert!(anon_history.list().expect("list anon history").is_empty());
+            assert!(anon_dictionary.list().expect("list anon dictionary").is_empty());
+            assert!(anon_correction_rules.list().expect("list anon rules").is_empty());
+            assert!(list_vocab_presets().expect("list anon presets").custom.is_empty());
+            let anon_state = anon_sync_state.get();
+            assert!(anon_state.cursor.is_none());
+            assert!(anon_state.pending_changes.is_empty());
         });
 
         unsafe {

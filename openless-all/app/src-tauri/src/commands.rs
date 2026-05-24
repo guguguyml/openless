@@ -25,8 +25,10 @@ use crate::coordinator::Coordinator;
 use crate::net;
 use crate::permissions::{self, PermissionStatus};
 use crate::persistence::{
-    activate_sync_profile_for_email, sync_style_pack_preferences, CredentialAccount,
-    CredentialsSnapshot, CredentialsVault, PreferencesStore, SyncAuthVault,
+    activate_default_sync_profile, activate_sync_profile_for_email,
+    anonymous_profile_has_user_data, bind_anonymous_profile_to_email,
+    sync_style_pack_preferences, CredentialAccount, CredentialsSnapshot, CredentialsVault,
+    PreferencesStore, SyncAuthVault,
 };
 use crate::polish::{
     http_client_builder, CodexOAuthConfig, CodexOAuthCredentials, CodexOAuthLLMProvider, LLMError,
@@ -843,7 +845,6 @@ pub async fn set_active_asr_provider(
         coord.release_local_asr_engine();
     }
     release_foundry_runtime_if_inactive(runtime.inner(), release_plan.foundry).await;
-    queue_preferences_sync_change(&*coord, &app)?;
     release_sherpa_runtime_if_inactive(sherpa_runtime.inner(), release_plan.sherpa).await;
     Ok(())
 }
@@ -855,7 +856,7 @@ pub fn set_active_llm_provider(
     provider: String,
 ) -> Result<(), String> {
     CredentialsVault::set_active_llm_provider(&provider).map_err(|e| e.to_string())?;
-    queue_preferences_sync_change(&*coord, &app)?;
+    let _ = (coord, app);
     Ok(())
 }
 
@@ -1585,13 +1586,8 @@ fn queue_preferences_sync_change(coord: &Coordinator, app: &AppHandle) -> Result
 }
 
 fn syncable_credential_account(account: CredentialAccount) -> bool {
-    matches!(
-        account,
-        CredentialAccount::ArkModelId
-            | CredentialAccount::ArkEndpoint
-            | CredentialAccount::AsrEndpoint
-            | CredentialAccount::AsrModel
-    )
+    let _ = account;
+    false
 }
 
 fn syncable_preferences_changed(before: &UserPreferences, after: &UserPreferences) -> bool {
@@ -1600,13 +1596,7 @@ fn syncable_preferences_changed(before: &UserPreferences, after: &UserPreference
 
 fn syncable_preferences_value(prefs: &UserPreferences) -> Value {
     json!({
-        "activeAsrProvider": prefs.active_asr_provider,
-        "activeLlmProvider": prefs.active_llm_provider,
         "activeStylePackId": prefs.active_style_pack_id,
-        "workingLanguages": prefs.working_languages,
-        "translationTargetLanguage": prefs.translation_target_language,
-        "chineseScriptPreference": prefs.chinese_script_preference,
-        "outputLanguagePreference": prefs.output_language_preference,
     })
 }
 
@@ -1711,32 +1701,22 @@ pub async fn sync_verify_email_code(
     code: String,
 ) -> Result<SyncLoginResult, SyncApiError> {
     let prelogin_settings = coord.sync_settings().get();
-    activate_sync_profile_for_email(email.trim()).map_err(|err| {
+    let prelogin_state = coord.sync_state().get();
+    let anonymous_profile_has_data = anonymous_profile_has_user_data().map_err(|err| {
         SyncApiError::local(
-            "sync_profile_activate_failed",
-            format!("同步账号档案切换失败：{err}"),
+            "sync_profile_inspect_failed",
+            format!("匿名档案检查失败：{err}"),
             false,
         )
     })?;
-    let mut settings = coord.sync_settings().get();
-    settings.server_url = prelogin_settings.server_url;
-    settings.device_name = prelogin_settings.device_name;
-    coord.sync_settings().set(settings.clone()).map_err(|err| {
-        SyncApiError::local(
-            "sync_settings_save_failed",
-            format!("同步设置保存失败：{err}"),
-            false,
-        )
-    })?;
-    let state = coord.sync_state().get();
-    let device_name = settings.device_name.trim().to_string();
-    let client = SyncApiClient::new(&settings.server_url, None)?;
+    let device_name = prelogin_settings.device_name.trim().to_string();
+    let client = SyncApiClient::new(&prelogin_settings.server_url, None)?;
     let result = client
         .verify_email_code(
             email.trim().to_string(),
             code,
             SyncDeviceInfo {
-                id: state.device_id,
+                id: prelogin_state.device_id.clone(),
                 name: if device_name.is_empty() {
                     "OpenLess device".into()
                 } else {
@@ -1755,6 +1735,17 @@ pub async fn sync_verify_email_code(
             false,
         )
     })?;
+    let mut state = coord.sync_state().get();
+    if state.device_id != prelogin_state.device_id {
+        state.device_id = prelogin_state.device_id;
+        coord.sync_state().set(state).map_err(|err| {
+            SyncApiError::local(
+                "sync_state_save_failed",
+                format!("同步设备状态保存失败：{err}"),
+                false,
+            )
+        })?;
+    }
     SyncAuthVault::set(&SyncAuthSession {
         account_email: account_email.clone(),
         access_token: result.access_token,
@@ -1770,6 +1761,9 @@ pub async fn sync_verify_email_code(
         )
     })?;
 
+    let mut settings = coord.sync_settings().get();
+    settings.server_url = prelogin_settings.server_url;
+    settings.device_name = prelogin_settings.device_name;
     settings.account_email = Some(account_email.clone());
     settings.enabled = true;
     coord.sync_settings().set(settings).map_err(|err| {
@@ -1783,6 +1777,7 @@ pub async fn sync_verify_email_code(
     Ok(SyncLoginResult {
         user: result.user,
         account_email,
+        anonymous_profile_has_data,
     })
 }
 
@@ -2041,66 +2036,13 @@ fn apply_preferences_provider_config_payload(
     prefs: &mut UserPreferences,
     payload: &PreferencesProviderConfigPayload,
 ) {
-    prefs.active_asr_provider = payload.active_asr_provider.clone();
-    prefs.active_llm_provider = payload.active_llm_provider.clone();
     prefs.active_style_pack_id = payload.active_style_pack_id.clone();
-    prefs.working_languages = payload.working_languages.clone();
-    prefs.translation_target_language = payload.translation_target_language.clone();
-    prefs.chinese_script_preference = payload.chinese_script_preference;
-    prefs.output_language_preference = payload.output_language_preference;
 }
 
 fn apply_preferences_provider_config_credentials(
     payload: &PreferencesProviderConfigPayload,
 ) -> Result<(), SyncApiError> {
-    CredentialsVault::set(CredentialAccount::AsrEndpoint, &payload.asr_base_url).map_err(
-        |err| {
-            SyncApiError::local(
-                "sync_preferences_save_failed",
-                format!("同步偏好写入 ASR endpoint 失败：{err}"),
-                false,
-            )
-        },
-    )?;
-    CredentialsVault::set(CredentialAccount::AsrModel, &payload.asr_model_name).map_err(|err| {
-        SyncApiError::local(
-            "sync_preferences_save_failed",
-            format!("同步偏好写入 ASR model 失败：{err}"),
-            false,
-        )
-    })?;
-    CredentialsVault::set(CredentialAccount::ArkEndpoint, &payload.llm_base_url).map_err(
-        |err| {
-            SyncApiError::local(
-                "sync_preferences_save_failed",
-                format!("同步偏好写入 LLM endpoint 失败：{err}"),
-                false,
-            )
-        },
-    )?;
-    CredentialsVault::set(CredentialAccount::ArkModelId, &payload.llm_model_name).map_err(
-        |err| {
-            SyncApiError::local(
-                "sync_preferences_save_failed",
-                format!("同步偏好写入 LLM model 失败：{err}"),
-                false,
-            )
-        },
-    )?;
-    CredentialsVault::set_active_asr_provider(&payload.active_asr_provider).map_err(|err| {
-        SyncApiError::local(
-            "sync_preferences_save_failed",
-            format!("同步偏好写入 ASR provider 失败：{err}"),
-            false,
-        )
-    })?;
-    CredentialsVault::set_active_llm_provider(&payload.active_llm_provider).map_err(|err| {
-        SyncApiError::local(
-            "sync_preferences_save_failed",
-            format!("同步偏好写入 LLM provider 失败：{err}"),
-            false,
-        )
-    })?;
+    let _ = payload;
     Ok(())
 }
 
@@ -2546,11 +2488,7 @@ fn build_pending_push_changes(
                 changes.vocab_presets.push(value);
                 pushed_change_ids.insert(change.id.clone());
             }
-            SyncEntityKind::Preferences | SyncEntityKind::ProviderConfig => {
-                let values = pending_preferences_provider_config_values(coord, state, change)?;
-                changes.provider_configs.extend(values);
-                pushed_change_ids.insert(change.id.clone());
-            }
+            SyncEntityKind::Preferences | SyncEntityKind::ProviderConfig => {}
             _ => {}
         }
     }
@@ -3119,6 +3057,13 @@ pub async fn sync_logout_device(coord: CoordinatorState<'_>) -> Result<SyncOkRes
             }
         }
     }
+    activate_default_sync_profile().map_err(|err| {
+        SyncApiError::local(
+            "sync_profile_activate_failed",
+            format!("同步匿名档案切换失败：{err}"),
+            false,
+        )
+    })?;
     Ok(SyncOkResult { ok: true })
 }
 
@@ -3154,13 +3099,6 @@ pub async fn sync_clear_cloud_data(
 pub fn sync_clear_local_profile_data(
     coord: CoordinatorState<'_>,
 ) -> Result<SyncOkResult, SyncApiError> {
-    SyncAuthVault::clear().map_err(|err| {
-        SyncApiError::local(
-            "sync_auth_clear_failed",
-            format!("同步登录凭据清除失败：{err}"),
-            false,
-        )
-    })?;
     coord.history().clear().map_err(|err| {
         SyncApiError::local(
             "history_clear_failed",
@@ -3194,25 +3132,46 @@ pub fn sync_clear_local_profile_data(
             )
         })?;
     coord
-        .sync_settings()
-        .set(SyncSettings::default())
-        .map_err(|err| {
-            SyncApiError::local(
-                "sync_settings_clear_failed",
-                format!("同步设置清空失败：{err}"),
-                false,
-            )
-        })?;
-    coord
         .sync_state()
-        .set(SyncState::default())
+        .set({
+            let mut state = coord.sync_state().get();
+            state.cursor = None;
+            state.last_sync_at = None;
+            state.last_push_at = None;
+            state.last_pull_at = None;
+            state.last_error = None;
+            state.pending_changes.clear();
+            state
+        })
         .map_err(|err| {
-            SyncApiError::local(
-                "sync_state_clear_failed",
-                format!("同步状态清空失败：{err}"),
-                false,
-            )
+            SyncApiError::local("sync_state_clear_failed", format!("同步状态清空失败：{err}"), false)
         })?;
+    Ok(SyncOkResult { ok: true })
+}
+
+#[tauri::command]
+pub fn sync_bind_anonymous_profile(coord: CoordinatorState<'_>) -> Result<SyncOkResult, SyncApiError> {
+    let session = SyncAuthVault::get().map_err(|err| {
+        SyncApiError::local(
+            "sync_auth_load_failed",
+            format!("同步登录凭据读取失败：{err}"),
+            false,
+        )
+    })?;
+    let Some(session) = session else {
+        return Err(SyncApiError::local(
+            "sync_login_required",
+            "请先登录同步账号",
+            false,
+        ));
+    };
+    bind_anonymous_profile_to_email(&session.account_email).map_err(|err| {
+        SyncApiError::local(
+            "sync_profile_bind_failed",
+            format!("匿名档案绑定失败：{err}"),
+            false,
+        )
+    })?;
     Ok(SyncOkResult { ok: true })
 }
 

@@ -319,6 +319,7 @@ pub struct SyncTokenRefreshResult {
 pub struct SyncLoginResult {
     pub user: SyncUserInfo,
     pub account_email: String,
+    pub anonymous_profile_has_data: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

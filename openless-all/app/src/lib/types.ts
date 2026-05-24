@@ -96,6 +96,7 @@ export interface SyncUserInfo {
 export interface SyncLoginResult {
   user: SyncUserInfo;
   accountEmail: string;
+  anonymousProfileHasData: boolean;
 }
 
 export interface SyncPushChanges {

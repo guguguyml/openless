@@ -558,6 +558,7 @@ export const zhTW: typeof zhCN = {
       clearLocalConfirm: '這會清空目前帳號在本機的歷史、詞彙、風格包、糾正規則與同步狀態，雲端資料會保留。繼續嗎？',
       clearLocalConfirmSecond: '清空後需要重新登入同步帳號，確定要繼續嗎？',
       clearLocalSuccess: '已清空本機目前帳號資料。',
+      bindAnonymousConfirm: '這台裝置有匿名資料。要把它綁定到 {{email}} 嗎？',
       advancedTitle: '進階設定',
       advancedDesc: '自訂同步伺服器與後續遷移入口。',
       serverUrlLabel: '同步服務位址',

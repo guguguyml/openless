@@ -821,8 +821,13 @@ export function syncVerifyEmailCode(email: string, code: string): Promise<SyncLo
     return {
       user: { id: 'mock-user', email },
       accountEmail: email,
+      anonymousProfileHasData: mockHistory.length > 0 || mockVocab.length > 0 || mockCorrectionRules.length > 0,
     };
   });
+}
+
+export function syncBindAnonymousProfile(): Promise<SyncOkResult> {
+  return invokeOrMock('sync_bind_anonymous_profile', undefined, () => ({ ok: true }));
 }
 
 export function syncPull(): Promise<SyncPullResult> {

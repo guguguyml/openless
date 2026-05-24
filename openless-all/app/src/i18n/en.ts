@@ -558,6 +558,7 @@ export const en: typeof zhCN = {
       clearLocalConfirm: 'This will clear local history, vocabulary, style packs, correction rules, and sync state for this account. Cloud data is kept. Continue?',
       clearLocalConfirmSecond: 'You will need to sign in again after clearing. Continue?',
       clearLocalSuccess: 'Local data for this account has been cleared.',
+      bindAnonymousConfirm: 'Anonymous local data was found on this device. Bind it to {{email}}?',
       advancedTitle: 'Advanced settings',
       advancedDesc: 'Custom sync server and migration placeholders.',
       serverUrlLabel: 'Sync server URL',

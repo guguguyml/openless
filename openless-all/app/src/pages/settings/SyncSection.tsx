@@ -8,6 +8,7 @@ import {
 	setSyncLastError,
 	syncClearCloudData,
 	syncClearLocalProfileData,
+	syncBindAnonymousProfile,
 	syncLogoutDevice,
 	syncPull,
 	syncPushPending,
@@ -149,6 +150,18 @@ export function SyncSection() {
 			const loginMessage = t("settings.sync.loginSuccess", { email: result.accountEmail });
 			emitSaved("saved", loginMessage);
 			setCode("");
+			if (result.anonymousProfileHasData && window.confirm(t("settings.sync.bindAnonymousConfirm", { email: result.accountEmail }))) {
+				try {
+					await syncBindAnonymousProfile();
+				} catch (bindError) {
+					const formatted = formatSyncError(bindError);
+					await setSyncLastError(formatted).catch(error => {
+						console.warn("[sync] save bind error failed", error);
+					});
+					emitSaved("failed", formatted);
+					return;
+				}
+			}
 			try {
 				const pullResult = await syncPull();
 				await syncPushPending();

@@ -560,6 +560,7 @@ export const ko: typeof zhCN = {
       clearLocalConfirm: '이 계정의 로컬 기록, 어휘, 스타일 팩, 수정 규칙, 동기화 상태를 삭제합니다. 클라우드 데이터는 유지됩니다. 계속할까요?',
       clearLocalConfirmSecond: '삭제 후 동기화 계정에 다시 로그인해야 합니다. 계속할까요?',
       clearLocalSuccess: '이 계정의 로컬 데이터를 삭제했습니다.',
+      bindAnonymousConfirm: '이 기기에 익명 데이터가 있습니다. {{email}}에 연결할까요?',
       advancedTitle: '고급 설정',
       advancedDesc: '동기화 서버 지정과 이전 기능 자리.',
       serverUrlLabel: '동기화 서버 URL',
