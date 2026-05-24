@@ -19,8 +19,8 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// 返回 `Ok(())` 表示文字已提交，`Err` 表示调用失败（插件未加载 / DBus 不通等）。
 pub fn commit_text(text: &str) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "CommitText")
         .map_err(|e| format!("build msg: {e}"))?
         .append1(text);
@@ -33,8 +33,8 @@ pub fn commit_text(text: &str) -> Result<(), String> {
 ///
 /// `keys` 为 Key::parse 格式的字符串数组，例如 `["Control+space"]`。
 pub fn set_hotkey(keys: &[&str]) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let list: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetHotkey")
         .map_err(|e| format!("build msg: {e}"))?
@@ -46,8 +46,8 @@ pub fn set_hotkey(keys: &[&str]) -> Result<(), String> {
 
 /// 通过 fcitx5 插件直接设置 sym + states 作为触发键。
 pub fn set_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetHotkeyRaw")
         .map_err(|e| format!("build msg: {e}"))?
         .append2(sym, states);
@@ -58,8 +58,8 @@ pub fn set_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
 
 /// 通过 fcitx5 插件设置 QA 面板快捷键 sym + states。
 pub fn set_qa_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetQaHotkeyRaw")
         .map_err(|e| format!("build msg: {e}"))?
         .append2(sym, states);
@@ -70,8 +70,8 @@ pub fn set_qa_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
 
 /// 通过 fcitx5 插件设置翻译模式修饰键 sym + states。
 pub fn set_translation_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetTranslationHotkeyRaw")
         .map_err(|e| format!("build msg: {e}"))?
         .append2(sym, states);
@@ -96,7 +96,9 @@ fn trigger_to_keysym(trigger: crate::types::HotkeyTrigger) -> u32 {
     match trigger {
         crate::types::HotkeyTrigger::RightControl => KEYSYM_CONTROL_R,
         crate::types::HotkeyTrigger::LeftControl => KEYSYM_CONTROL_L,
-        crate::types::HotkeyTrigger::RightOption | crate::types::HotkeyTrigger::RightAlt => KEYSYM_ALT_R,
+        crate::types::HotkeyTrigger::RightOption | crate::types::HotkeyTrigger::RightAlt => {
+            KEYSYM_ALT_R
+        }
         crate::types::HotkeyTrigger::LeftOption => KEYSYM_ALT_L,
         crate::types::HotkeyTrigger::RightCommand => KEYSYM_SUPER_R,
         crate::types::HotkeyTrigger::Fn => KEYSYM_CONTROL_R,
@@ -166,13 +168,11 @@ pub fn binding_to_fcitx_key_string(binding: &crate::types::ShortcutBinding) -> S
 
 /// 通过 fcitx5 插件的 SetCustomDictationTrigger 方法设置自定义组合键。
 pub fn set_custom_dictation_trigger(key_string: &str) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
-    let msg = dbus::Message::new_method_call(
-        DEST, PATH, IFACE, "SetCustomDictationTrigger",
-    )
-    .map_err(|e| format!("build msg: {e}"))?
-    .append1(key_string);
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
+    let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetCustomDictationTrigger")
+        .map_err(|e| format!("build msg: {e}"))?
+        .append1(key_string);
     conn.send_with_reply_and_block(msg, TIMEOUT)
         .map_err(|e| format!("SetCustomDictationTrigger: {e}"))?;
     Ok(())
@@ -188,7 +188,9 @@ pub fn sync_qa_binding(trigger: Option<crate::types::HotkeyTrigger>) {
     let sym = trigger_to_keysym(trigger);
     let name = trigger_name(trigger);
     match set_qa_hotkey_raw(sym, 0) {
-        Ok(()) => log::info!("[fcitx] Synced QA hotkey {name} (sym={sym}) to plugin via SetQaHotkeyRaw"),
+        Ok(()) => {
+            log::info!("[fcitx] Synced QA hotkey {name} (sym={sym}) to plugin via SetQaHotkeyRaw")
+        }
         Err(e) => log::warn!("[fcitx] Failed to sync QA hotkey to plugin: {e}"),
     }
 }
@@ -229,9 +231,7 @@ pub fn available() -> bool {
 ///
 /// 后台线程在 `tx` 全部 drop（协调器关闭）或 DBus 连接断开时自动退出。
 #[cfg(target_os = "linux")]
-pub fn start_dictation_signal_listener(
-    tx: std::sync::mpsc::Sender<crate::hotkey::HotkeyEvent>,
-) {
+pub fn start_dictation_signal_listener(tx: std::sync::mpsc::Sender<crate::hotkey::HotkeyEvent>) {
     use std::time::Duration;
 
     std::thread::Builder::new()
@@ -264,7 +264,10 @@ pub fn start_dictation_signal_listener(
                 let member_str: String = member.as_ref().map(|m| m.to_string()).unwrap_or_default();
                 log::debug!(
                     "[fcitx-hotkey] Signal {}: sym={}, states={}, isPress={}",
-                    member_str, sym, states, is_press,
+                    member_str,
+                    sym,
+                    states,
+                    is_press,
                 );
                 if let Some(member) = member {
                     if member == "DictationKeyEvent" {
@@ -280,7 +283,8 @@ pub fn start_dictation_signal_listener(
                         }
                     } else if member == "TranslationModifierEvent" {
                         if is_press {
-                            let _ = tx2.send(crate::hotkey::HotkeyEvent::TranslationModifierPressed);
+                            let _ =
+                                tx2.send(crate::hotkey::HotkeyEvent::TranslationModifierPressed);
                         }
                     }
                 }

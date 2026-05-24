@@ -2985,7 +2985,10 @@ fn sync_auth_keyring_account() -> Result<String> {
 
 fn sync_auth_keyring_accounts() -> Result<Vec<String>> {
     let mut accounts = vec![sync_auth_keyring_account()?];
-    if !accounts.iter().any(|account| account == KEYRING_SYNC_AUTH_ACCOUNT) {
+    if !accounts
+        .iter()
+        .any(|account| account == KEYRING_SYNC_AUTH_ACCOUNT)
+    {
         accounts.push(KEYRING_SYNC_AUTH_ACCOUNT.to_string());
     }
     Ok(accounts)
@@ -2995,11 +2998,10 @@ fn sync_auth_keyring_accounts() -> Result<Vec<String>> {
 mod tests {
     use super::{
         activate_sync_profile_for_email, chunk_json_payload, list_vocab_presets, read_or_default,
-        read_preferences, save_vocab_presets, sync_style_pack_preferences,
-        sync_auth_keyring_accounts, validate_correction_rule_syntax, CorrectionRuleStore,
+        read_preferences, save_vocab_presets, sync_auth_keyring_accounts,
+        sync_style_pack_preferences, validate_correction_rule_syntax, CorrectionRuleStore,
         DictionaryStore, HistoryStore, PreferencesStore, StylePackStore, SyncSettingsStore,
-        SyncStateStore,
-        DEFAULT_SYNC_PROFILE_ID, KEYRING_CHUNK_MAX_UTF16_UNITS,
+        SyncStateStore, DEFAULT_SYNC_PROFILE_ID, KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
     use crate::types::{
         builtin_style_packs, CustomStylePrompts, DictationSession, InsertStatus, PendingSyncChange,
@@ -3161,7 +3163,9 @@ mod tests {
         let accounts = sync_auth_keyring_accounts().expect("sync auth accounts");
         assert_eq!(accounts.len(), 2);
         assert!(accounts.iter().any(|account| account == "sync.auth.v1"));
-        assert!(accounts.iter().any(|account| account.starts_with("sync.auth.v1.")));
+        assert!(accounts
+            .iter()
+            .any(|account| account.starts_with("sync.auth.v1.")));
 
         unsafe {
             if let Some(value) = old_xdg {
@@ -3781,8 +3785,14 @@ mod tests {
             assert_eq!(after.active_llm_provider, before.active_llm_provider);
             assert_eq!(after.local_asr_active_model, before.local_asr_active_model);
             assert_eq!(after.local_asr_mirror, before.local_asr_mirror);
-            assert_eq!(after.local_asr_keep_loaded_secs, before.local_asr_keep_loaded_secs);
-            assert_eq!(after.foundry_local_asr_model, before.foundry_local_asr_model);
+            assert_eq!(
+                after.local_asr_keep_loaded_secs,
+                before.local_asr_keep_loaded_secs
+            );
+            assert_eq!(
+                after.foundry_local_asr_model,
+                before.foundry_local_asr_model
+            );
             assert_eq!(
                 after.foundry_local_runtime_source,
                 before.foundry_local_runtime_source
