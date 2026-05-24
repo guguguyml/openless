@@ -1217,8 +1217,14 @@ impl PreferencesStore {
         Ok(())
     }
 
-    pub fn reset_current_profile(&self) -> Result<UserPreferences> {
-        let prefs = UserPreferences::default();
+    pub fn reset_current_profile_style_pack_preferences(&self) -> Result<UserPreferences> {
+        let mut prefs = self.get();
+        let defaults = UserPreferences::default();
+        prefs.default_mode = defaults.default_mode;
+        prefs.enabled_modes = defaults.enabled_modes;
+        prefs.active_style_pack_id = defaults.active_style_pack_id;
+        prefs.style_system_prompts = defaults.style_system_prompts;
+        prefs.custom_style_prompts = defaults.custom_style_prompts;
         self.set(prefs.clone())?;
         Ok(prefs)
     }
@@ -1920,7 +1926,7 @@ impl StylePackStore {
         let _ = fs::remove_dir_all(&asset_root);
         ensure_dir(&asset_root)?;
         let mut packs = Vec::new();
-        let mut prefs_snapshot = prefs.reset_current_profile()?;
+        let mut prefs_snapshot = prefs.reset_current_profile_style_pack_preferences()?;
         let mut changed = migrate_style_packs_from_preferences(&mut packs, &prefs_snapshot);
         if ensure_at_least_one_style_pack_enabled(&mut packs) {
             changed = true;
@@ -3712,6 +3718,132 @@ mod tests {
         assert_eq!(prefs.style_system_prompts.structured, packs[2].prompt);
         assert_eq!(prefs.style_system_prompts.formal, packs[3].prompt);
         assert_eq!(prefs.custom_style_prompts, CustomStylePrompts::default());
+    }
+
+    #[test]
+    fn reset_style_packs_keeps_service_and_advanced_preferences() {
+        let _guard = TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let tmp: PathBuf = std::env::temp_dir().join(format!(
+            "openless-style-pack-reset-prefs-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = tmp.join("home");
+        let xdg = tmp.join("xdg");
+        fs::create_dir_all(&home).expect("create temp home");
+        fs::create_dir_all(&xdg).expect("create temp xdg");
+
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_DATA_HOME", &xdg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            activate_sync_profile_for_email("prefs@example.com").expect("activate profile");
+            let prefs = PreferencesStore::new().expect("prefs store");
+            let style_packs = StylePackStore::new(&prefs).expect("style store");
+
+            let mut before = prefs.get();
+            before.active_asr_provider = "foundry-local-whisper".into();
+            before.active_llm_provider = "openai".into();
+            before.local_asr_active_model = "qwen3-asr-1.7b".into();
+            before.local_asr_mirror = "hf-mirror".into();
+            before.local_asr_keep_loaded_secs = 86_400;
+            before.foundry_local_asr_model = "whisper-large-v3-turbo".into();
+            before.foundry_local_runtime_source = "nuget".into();
+            before.foundry_local_asr_language_hint = "zh".into();
+            before.foundry_local_asr_keep_loaded_secs = 600;
+            before.sherpa_onnx_model = "sherpa-custom".into();
+            before.sherpa_onnx_language_hint = "en".into();
+            before.sherpa_onnx_keep_loaded_secs = 900;
+            before.history_retention_days = 30;
+            before.polish_context_window_minutes = 15;
+            before.start_minimized = true;
+            before.streaming_insert = false;
+            before.streaming_insert_save_clipboard = false;
+            before.auto_update_check = false;
+            before.history_max_entries = Some(88);
+            before.record_audio_for_debug = true;
+            before.audio_recording_max_entries = Some(7);
+            before.marketplace_base_url = "https://market.example.com".into();
+            before.marketplace_dev_login = "alice".into();
+            before.active_style_pack_id = "custom.pack".into();
+            before.custom_style_prompts.light = "custom light".into();
+            prefs.set(before.clone()).expect("save prefs");
+
+            style_packs
+                .reset_current_profile(&prefs)
+                .expect("reset style packs");
+
+            let after = prefs.get();
+            assert_eq!(after.active_asr_provider, before.active_asr_provider);
+            assert_eq!(after.active_llm_provider, before.active_llm_provider);
+            assert_eq!(after.local_asr_active_model, before.local_asr_active_model);
+            assert_eq!(after.local_asr_mirror, before.local_asr_mirror);
+            assert_eq!(after.local_asr_keep_loaded_secs, before.local_asr_keep_loaded_secs);
+            assert_eq!(after.foundry_local_asr_model, before.foundry_local_asr_model);
+            assert_eq!(
+                after.foundry_local_runtime_source,
+                before.foundry_local_runtime_source
+            );
+            assert_eq!(
+                after.foundry_local_asr_language_hint,
+                before.foundry_local_asr_language_hint
+            );
+            assert_eq!(
+                after.foundry_local_asr_keep_loaded_secs,
+                before.foundry_local_asr_keep_loaded_secs
+            );
+            assert_eq!(after.sherpa_onnx_model, before.sherpa_onnx_model);
+            assert_eq!(
+                after.sherpa_onnx_language_hint,
+                before.sherpa_onnx_language_hint
+            );
+            assert_eq!(
+                after.sherpa_onnx_keep_loaded_secs,
+                before.sherpa_onnx_keep_loaded_secs
+            );
+            assert_eq!(after.history_retention_days, before.history_retention_days);
+            assert_eq!(
+                after.polish_context_window_minutes,
+                before.polish_context_window_minutes
+            );
+            assert_eq!(after.start_minimized, before.start_minimized);
+            assert_eq!(after.streaming_insert, before.streaming_insert);
+            assert_eq!(
+                after.streaming_insert_save_clipboard,
+                before.streaming_insert_save_clipboard
+            );
+            assert_eq!(after.auto_update_check, before.auto_update_check);
+            assert_eq!(after.history_max_entries, before.history_max_entries);
+            assert_eq!(after.record_audio_for_debug, before.record_audio_for_debug);
+            assert_eq!(
+                after.audio_recording_max_entries,
+                before.audio_recording_max_entries
+            );
+            assert_eq!(after.marketplace_base_url, before.marketplace_base_url);
+            assert_eq!(after.marketplace_dev_login, before.marketplace_dev_login);
+            assert_ne!(after.active_style_pack_id, "custom.pack");
+            assert_eq!(after.custom_style_prompts, CustomStylePrompts::default());
+        });
+
+        unsafe {
+            if let Some(value) = old_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn temp_style_pack_store(name: &str) -> (PathBuf, StylePackStore) {

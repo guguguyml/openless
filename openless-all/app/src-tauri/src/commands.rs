@@ -3099,7 +3099,7 @@ pub async fn sync_logout_device(coord: CoordinatorState<'_>) -> Result<SyncOkRes
         )
     })?;
     let device_id = coord.sync_state().get().device_id;
-    clear_local_sync_login_state(&coord)?;
+    clear_local_sync_login_state()?;
     if let Some(session) = session {
         if let Some(refresh_token) = session
             .refresh_token
@@ -3289,7 +3289,7 @@ async fn refresh_sync_auth_session(
         Ok(result) => result,
         Err(error) => {
             if sync_refresh_token_error(&error) {
-                clear_local_sync_login_state(coord)?;
+                clear_local_sync_login_state()?;
             }
             return Err(error);
         }
@@ -3332,21 +3332,11 @@ fn sync_refresh_token_error(error: &SyncApiError) -> bool {
         )
 }
 
-fn clear_local_sync_login_state(coord: &Coordinator) -> Result<(), SyncApiError> {
+fn clear_local_sync_login_state() -> Result<(), SyncApiError> {
     SyncAuthVault::clear().map_err(|err| {
         SyncApiError::local(
             "sync_auth_clear_failed",
             format!("同步登录凭据清除失败：{err}"),
-            false,
-        )
-    })?;
-    let mut settings = coord.sync_settings().get();
-    settings.enabled = false;
-    settings.account_email = None;
-    coord.sync_settings().set(settings).map_err(|err| {
-        SyncApiError::local(
-            "sync_settings_save_failed",
-            format!("同步设置保存失败：{err}"),
             false,
         )
     })?;
