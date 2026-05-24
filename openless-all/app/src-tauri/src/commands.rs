@@ -3182,13 +3182,7 @@ pub fn sync_clear_local_profile_data(
             false,
         )
     })?;
-    crate::persistence::save_vocab_presets(&VocabPresetStore::default()).map_err(|err| {
-        SyncApiError::local(
-            "vocab_presets_clear_failed",
-            format!("词汇预设清空失败：{err}"),
-            false,
-        )
-    })?;
+    // 词汇预设保留内置默认和用户本地自定义项，不在这里清空。
     coord
         .style_packs()
         .reset_current_profile(coord.prefs())

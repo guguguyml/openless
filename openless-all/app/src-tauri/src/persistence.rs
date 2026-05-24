@@ -2963,8 +2963,9 @@ impl SyncAuthVault {
 
     pub fn clear() -> Result<()> {
         let _guard = credentials_lock().lock();
-        let account = sync_auth_keyring_account()?;
-        delete_keyring_password(&account);
+        for account in sync_auth_keyring_accounts()? {
+            delete_keyring_password(&account);
+        }
         Ok(())
     }
 }
@@ -2976,13 +2977,22 @@ fn sync_auth_keyring_account() -> Result<String> {
     ))
 }
 
+fn sync_auth_keyring_accounts() -> Result<Vec<String>> {
+    let mut accounts = vec![sync_auth_keyring_account()?];
+    if !accounts.iter().any(|account| account == KEYRING_SYNC_AUTH_ACCOUNT) {
+        accounts.push(KEYRING_SYNC_AUTH_ACCOUNT.to_string());
+    }
+    Ok(accounts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         activate_sync_profile_for_email, chunk_json_payload, list_vocab_presets, read_or_default,
         read_preferences, save_vocab_presets, sync_style_pack_preferences,
-        validate_correction_rule_syntax, CorrectionRuleStore, DictionaryStore, HistoryStore,
-        PreferencesStore, StylePackStore, SyncSettingsStore, SyncStateStore,
+        sync_auth_keyring_accounts, validate_correction_rule_syntax, CorrectionRuleStore,
+        DictionaryStore, HistoryStore, PreferencesStore, StylePackStore, SyncSettingsStore,
+        SyncStateStore,
         DEFAULT_SYNC_PROFILE_ID, KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
     use crate::types::{
@@ -3053,10 +3063,12 @@ mod tests {
 
     #[test]
     fn vocab_presets_roundtrip_json_file() {
+        let _guard = TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
         let tmp: PathBuf =
             std::env::temp_dir().join(format!("openless-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&tmp).expect("create temp dir");
         // Linux path helper uses XDG_DATA_HOME first.
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
         unsafe {
             std::env::set_var("XDG_DATA_HOME", &tmp);
         }
@@ -3083,6 +3095,13 @@ mod tests {
             vec!["PR".to_string(), "CI".to_string()]
         );
         assert_eq!(loaded.disabled_builtin_preset_ids, vec!["chef".to_string()]);
+        unsafe {
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -3119,6 +3138,32 @@ mod tests {
         assert_eq!(reloaded.cursor.as_deref(), Some("cursor-42"));
         assert_eq!(reloaded.pending_changes.len(), 1);
         assert_eq!(reloaded.pending_changes[0].entity_id, "pack-1");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sync_auth_clear_targets_current_and_legacy_accounts() {
+        let _guard = TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let tmp: PathBuf =
+            std::env::temp_dir().join(format!("openless-sync-auth-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        let old_xdg = std::env::var("XDG_DATA_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+        }
+
+        let accounts = sync_auth_keyring_accounts().expect("sync auth accounts");
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|account| account == "sync.auth.v1"));
+        assert!(accounts.iter().any(|account| account.starts_with("sync.auth.v1.")));
+
+        unsafe {
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 
