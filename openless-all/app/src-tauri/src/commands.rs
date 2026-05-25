@@ -1597,73 +1597,46 @@ fn syncable_preferences_changed(before: &UserPreferences, after: &UserPreference
 fn syncable_preferences_value(prefs: &UserPreferences) -> Value {
     json!({
         "activeStylePackId": prefs.active_style_pack_id,
+        "workingLanguages": prefs.working_languages,
+        "translationTargetLanguage": prefs.translation_target_language,
     })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PreferencesProviderConfigPayload {
-    active_asr_provider: String,
-    active_llm_provider: String,
-    asr_base_url: String,
-    asr_model_name: String,
-    llm_base_url: String,
-    llm_model_name: String,
     active_style_pack_id: String,
     working_languages: Vec<String>,
     translation_target_language: String,
-    chinese_script_preference: ChineseScriptPreference,
-    output_language_preference: OutputLanguagePreference,
 }
 
-fn preferences_provider_config_payload(
-    prefs: &UserPreferences,
-    credentials: &CredentialsSnapshot,
-    active_asr_provider: &str,
-    active_llm_provider: &str,
-) -> String {
+fn preferences_provider_config_payload(prefs: &UserPreferences) -> String {
     let payload = PreferencesProviderConfigPayload {
-        active_asr_provider: active_asr_provider.to_string(),
-        active_llm_provider: active_llm_provider.to_string(),
-        asr_base_url: credentials.asr_endpoint.clone().unwrap_or_default(),
-        asr_model_name: credentials.asr_model.clone().unwrap_or_default(),
-        llm_base_url: credentials.ark_endpoint.clone().unwrap_or_default(),
-        llm_model_name: credentials.ark_model_id.clone().unwrap_or_default(),
         active_style_pack_id: prefs.active_style_pack_id.clone(),
         working_languages: prefs.working_languages.clone(),
         translation_target_language: prefs.translation_target_language.clone(),
-        chinese_script_preference: prefs.chinese_script_preference,
-        output_language_preference: prefs.output_language_preference,
     };
     serde_json::to_string(&payload).expect("preferences provider config payload should encode")
 }
 
-fn preferences_provider_config_push_values(
+fn preferences_provider_config_push_value(
     prefs: &UserPreferences,
-    credentials: &CredentialsSnapshot,
-    active_asr_provider: &str,
-    active_llm_provider: &str,
     device_id: &str,
     updated_at: &str,
     version: i64,
-) -> Vec<Value> {
-    vec![json!({
+) -> Value {
+    json!({
         "id": PREFERENCES_SYNC_ENTITY_ID,
         "device_id": device_id,
         "provider_type": PREFERENCES_PROVIDER_CONFIG_TYPE,
         "base_url": PREFERENCES_PROVIDER_CONFIG_BASE_URL,
         "model_name": PREFERENCES_PROVIDER_CONFIG_MODEL_NAME,
-        "language": preferences_provider_config_payload(
-            prefs,
-            credentials,
-            active_asr_provider,
-            active_llm_provider
-        ),
+        "language": preferences_provider_config_payload(prefs),
         "default_prompt_id": prefs.active_style_pack_id,
         "created_at": updated_at,
         "updated_at": updated_at,
         "version": version,
-    })]
+    })
 }
 
 #[tauri::command]
@@ -1990,7 +1963,6 @@ fn apply_pulled_provider_configs(
 
         let payload = preferences_provider_config_payload_from_value(value)?;
         apply_preferences_provider_config_payload(&mut prefs, &payload);
-        apply_preferences_provider_config_credentials(&payload)?;
         applied = true;
     }
 
@@ -2037,13 +2009,8 @@ fn apply_preferences_provider_config_payload(
     payload: &PreferencesProviderConfigPayload,
 ) {
     prefs.active_style_pack_id = payload.active_style_pack_id.clone();
-}
-
-fn apply_preferences_provider_config_credentials(
-    payload: &PreferencesProviderConfigPayload,
-) -> Result<(), SyncApiError> {
-    let _ = payload;
-    Ok(())
+    prefs.working_languages = payload.working_languages.clone();
+    prefs.translation_target_language = payload.translation_target_language.clone();
 }
 
 fn apply_pulled_history_items(
@@ -2488,8 +2455,11 @@ fn build_pending_push_changes(
                 changes.vocab_presets.push(value);
                 pushed_change_ids.insert(change.id.clone());
             }
-            SyncEntityKind::Preferences | SyncEntityKind::ProviderConfig => {}
-            _ => {}
+            SyncEntityKind::Preferences | SyncEntityKind::ProviderConfig => {
+                let value = pending_preferences_provider_config_values(coord, state, change)?;
+                changes.provider_configs.push(value);
+                pushed_change_ids.insert(change.id.clone());
+            }
         }
     }
     Ok((changes, pushed_change_ids))
@@ -2499,7 +2469,7 @@ fn pending_preferences_provider_config_values(
     coord: &Coordinator,
     state: &SyncState,
     change: &PendingSyncChange,
-) -> Result<Vec<Value>, SyncApiError> {
+) -> Result<Value, SyncApiError> {
     if change.operation == SyncChangeOperation::Delete {
         return Err(SyncApiError::local(
             "sync_preferences_delete_unsupported",
@@ -2508,14 +2478,8 @@ fn pending_preferences_provider_config_values(
         ));
     }
     let prefs = coord.prefs().get();
-    let credentials = CredentialsVault::snapshot();
-    let active_asr_provider = CredentialsVault::get_active_asr();
-    let active_llm_provider = CredentialsVault::get_active_llm();
-    Ok(preferences_provider_config_push_values(
+    Ok(preferences_provider_config_push_value(
         &prefs,
-        &credentials,
-        &active_asr_provider,
-        &active_llm_provider,
         &state.device_id,
         &change.queued_at,
         change.attempts as i64 + 1,
@@ -5544,7 +5508,7 @@ mod tests {
         llm_configured_for_provider, local_asr_release_plan_for_provider, models_url,
         normalize_foundry_language_hint, parse_gemini_model_ids, parse_latest_beta_from_atom,
         parse_model_ids, persist_settings, preferences_provider_config_payload_from_value,
-        preferences_provider_config_push_values, pulled_history_value_to_session,
+        preferences_provider_config_push_value, pulled_history_value_to_session,
         release_foundry_runtime_if_inactive, release_sherpa_runtime_if_inactive,
         successful_pull_state, successful_push_pending_state, sync_deleted_at,
         syncable_credential_account, syncable_preferences_value, validate_foundry_model_alias,
@@ -5900,18 +5864,31 @@ mod tests {
     #[test]
     fn syncable_preferences_value_excludes_audio_and_local_only_settings() {
         let prefs = UserPreferences {
+            active_style_pack_id: "custom.meeting".into(),
+            working_languages: vec!["中文".into(), "English".into()],
+            translation_target_language: "日语".into(),
             record_audio_for_debug: true,
             audio_recording_max_entries: Some(12),
             microphone_device_name: "Studio Mic".into(),
+            chinese_script_preference: ChineseScriptPreference::Traditional,
+            output_language_preference: OutputLanguagePreference::ZhTw,
             ..Default::default()
         };
 
         let value = syncable_preferences_value(&prefs);
 
         assert_no_forbidden_sync_keys(&value);
+        assert_eq!(value["activeStylePackId"], "custom.meeting");
+        assert_eq!(
+            value["workingLanguages"],
+            serde_json::json!(["中文", "English"])
+        );
+        assert_eq!(value["translationTargetLanguage"], "日语");
         assert!(value.get("recordAudioForDebug").is_none());
         assert!(value.get("audioRecordingMaxEntries").is_none());
         assert!(value.get("microphoneDeviceName").is_none());
+        assert!(value.get("chineseScriptPreference").is_none());
+        assert!(value.get("outputLanguagePreference").is_none());
     }
 
     #[test]
@@ -5926,28 +5903,9 @@ mod tests {
             output_language_preference: OutputLanguagePreference::ZhTw,
             ..Default::default()
         };
-        let credentials = CredentialsSnapshot {
-            asr_endpoint: Some("https://asr.example.com/v1".into()),
-            asr_model: Some("whisper-1".into()),
-            ark_endpoint: Some("https://llm.example.com/v1".into()),
-            ark_model_id: Some("glm-4.5".into()),
-            asr_api_key: Some("secret-asr".into()),
-            ark_api_key: Some("secret-llm".into()),
-            ..snapshot()
-        };
+        let value =
+            preferences_provider_config_push_value(&prefs, "device-1", "2026-05-21T00:00:00Z", 2);
 
-        let values = preferences_provider_config_push_values(
-            &prefs,
-            &credentials,
-            "whisper",
-            "ark",
-            "device-1",
-            "2026-05-21T00:00:00Z",
-            2,
-        );
-
-        assert_eq!(values.len(), 1);
-        let value = &values[0];
         assert_eq!(value["id"], PREFERENCES_SYNC_ENTITY_ID);
         assert_eq!(value["provider_type"], PREFERENCES_PROVIDER_CONFIG_TYPE);
         assert_eq!(value["base_url"], PREFERENCES_PROVIDER_CONFIG_BASE_URL);
@@ -5955,32 +5913,22 @@ mod tests {
         assert_eq!(value["device_id"], "device-1");
         assert_eq!(value["created_at"], "2026-05-21T00:00:00Z");
         assert_eq!(value["updated_at"], "2026-05-21T00:00:00Z");
-        assert_no_forbidden_sync_keys(value);
+        assert_no_forbidden_sync_keys(&value);
 
         let payload: PreferencesProviderConfigPayload =
             serde_json::from_str(value["language"].as_str().expect("language payload")).unwrap();
         let payload_value: Value =
             serde_json::from_str(value["language"].as_str().expect("language payload")).unwrap();
         assert_no_forbidden_sync_keys(&payload_value);
-        assert_eq!(payload.active_asr_provider, "whisper");
-        assert_eq!(payload.active_llm_provider, "ark");
-        assert_eq!(payload.asr_base_url, "https://asr.example.com/v1");
-        assert_eq!(payload.asr_model_name, "whisper-1");
-        assert_eq!(payload.llm_base_url, "https://llm.example.com/v1");
-        assert_eq!(payload.llm_model_name, "glm-4.5");
         assert_eq!(payload.active_style_pack_id, "custom.meeting");
         assert_eq!(payload.working_languages, vec!["中文", "English"]);
         assert_eq!(payload.translation_target_language, "日语");
-        assert_eq!(
-            payload.chinese_script_preference,
-            ChineseScriptPreference::Traditional
-        );
-        assert_eq!(
-            payload.output_language_preference,
-            OutputLanguagePreference::ZhTw
-        );
-        assert!(!value.to_string().contains("secret-asr"));
-        assert!(!value.to_string().contains("secret-llm"));
+        assert!(!value.to_string().contains("activeAsrProvider"));
+        assert!(!value.to_string().contains("activeLlmProvider"));
+        assert!(!value.to_string().contains("asrBaseUrl"));
+        assert!(!value.to_string().contains("llmBaseUrl"));
+        assert!(!value.to_string().contains("chineseScriptPreference"));
+        assert!(!value.to_string().contains("outputLanguagePreference"));
     }
 
     #[test]
@@ -5991,17 +5939,9 @@ mod tests {
             "base_url": PREFERENCES_PROVIDER_CONFIG_BASE_URL,
             "model_name": PREFERENCES_PROVIDER_CONFIG_MODEL_NAME,
             "language": serde_json::to_string(&PreferencesProviderConfigPayload {
-                active_asr_provider: "whisper".into(),
-                active_llm_provider: "ark".into(),
-                asr_base_url: "https://asr.example.com/v1".into(),
-                asr_model_name: "whisper-1".into(),
-                llm_base_url: "https://llm.example.com/v1".into(),
-                llm_model_name: "glm-4.5".into(),
                 active_style_pack_id: "custom.meeting".into(),
                 working_languages: vec!["中文".into(), "English".into()],
                 translation_target_language: "日语".into(),
-                chinese_script_preference: ChineseScriptPreference::Traditional,
-                output_language_preference: OutputLanguagePreference::ZhTw,
             })
             .unwrap()
         });
@@ -6010,18 +5950,16 @@ mod tests {
         let mut prefs = UserPreferences::default();
         apply_preferences_provider_config_payload(&mut prefs, &payload);
 
-        assert_eq!(prefs.active_asr_provider, "whisper");
-        assert_eq!(prefs.active_llm_provider, "ark");
         assert_eq!(prefs.active_style_pack_id, "custom.meeting");
         assert_eq!(prefs.working_languages, vec!["中文", "English"]);
         assert_eq!(prefs.translation_target_language, "日语");
         assert_eq!(
             prefs.chinese_script_preference,
-            ChineseScriptPreference::Traditional
+            UserPreferences::default().chinese_script_preference
         );
         assert_eq!(
             prefs.output_language_preference,
-            OutputLanguagePreference::ZhTw
+            UserPreferences::default().output_language_preference
         );
         assert!(!prefs.launch_at_login);
     }
