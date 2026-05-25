@@ -378,7 +378,7 @@ export function ProvidersSection() {
                   ? 'asrSherpaOnnxLocal'
                   : null;
             return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start', minWidth: 0 }}>
+              <div style={{ minWidth: 0 }}>
                 <SelectLite
                   value={selectedValue}
                   disabled={isLocked}
